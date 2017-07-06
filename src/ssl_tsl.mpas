@@ -1,0 +1,207 @@
+unit ssl_tsl;
+
+uses dspic_additional_string_library,lib_Delays_LIO,def_io,lib1_enc600_V3_5_b,
+     enc_lib_user,lib2_enc600_V3_5_b,df_lib_SPI1,crc16_lib,
+     Tftp_Server,config,HTTP_Send;
+
+procedure SSL_Init;
+procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
+function OpenTCPConnection_SSL(port : word) : boolean;
+function SendTCP_SSL(len : word) : boolean;
+function SendTCPwait_SSL(len : word) : boolean;
+function Open_SSL(port : word) : boolean;
+
+implementation
+
+procedure SSL_Init;
+begin
+  HTTP_send_Port_ssl := TMR1 + 23456;
+  certificate_len := 0;
+  host_response_len_ssl := 0;
+end;
+
+procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
+var max_len : word;
+label next_;
+begin
+  Socket[j].Keep_Alive := true;
+
+  if host_response_len_ssl >= 3072 then exit;
+
+  if host_response_len_ssl <> 0 then    // one packet arrived
+    begin
+      max_len := 3072 - host_response_len_ssl;
+      if len_ > max_len then len_ := max_len;
+    end;
+
+  CopyEthMem_CPToRam(@host_response[host_response_len_ssl], len_);
+  host_response_len_ssl := host_response_len_ssl + len_;
+end;
+
+function OpenTCPConnection_SSL(port : word) : boolean;
+var i : word;
+label end_end_,again_;
+begin
+  i := 0;
+
+again_:
+
+  Wait_With_Eth(100);
+
+  result := false;
+
+  if Str_Len(server_address_url) < 3 then exit;
+
+  if IsIP(server_address_url) <> 0 then
+    begin
+      Str2IP(server_address_url,server_addr);
+    end
+  else
+  if Dns_Resolve(server_address_url,server_addr) = false then
+  if Dns_Resolve(server_address_url,server_addr) = false then
+    begin
+      if UDP_debug <> 0 then
+        begin
+          Socket_TCP_buf := 'DNS fail';
+          out_broadcast_string(33335);
+        end;
+      goto end_end_;
+    end;
+
+  o_sock_ssl := 11;
+
+  Close_TCP_Connection_Advance(o_sock_ssl);   // we use tcp socket 11
+
+  TCP_Close_Port(HTTP_send_Port_ssl);
+
+  HTTP_send_Port_ssl := HTTP_send_Port_ssl + 1;
+
+  if HTTP_send_Port_ssl > 65000 then HTTP_send_Port_ssl := TMR1 + 23456;
+
+  TCP_Open_Port(HTTP_send_Port_ssl);
+
+  if Open_TCP_Connection_Advance(server_addr,port,HTTP_send_Port_ssl,o_sock_ssl) <> 0 then
+    begin
+      result := true;
+      exit;
+    end;
+
+end_end_:
+  if i < 2 then
+    begin
+      inc(i);
+      goto again_; // try one more time
+    end;
+end;
+
+function SendTCP_SSL(len : word) : boolean;
+begin
+
+  Wait_With_Eth(100);
+
+  result := false;
+
+  if Socket[o_sock_ssl].State_S <> 2 then exit;
+
+      if UDP_debug <> 0 then
+        begin
+          Mem_Cpy(@Socket_TCP_buf,@HTTP_data_out,len);
+          out_broadcast(33335,len);
+        end;
+
+      Socket[o_sock_ssl].RAM_ROM := 0;
+      Socket[o_sock_ssl].Keep_Alive := true;
+      Socket[o_sock_ssl].Exp_Time_Val := 100;
+      Socket[o_sock_ssl].Do_Not_Fragment := 1;
+      Socket[o_sock_ssl].Start_addr := @HTTP_data_out;
+      Socket[o_sock_ssl].Stop_addr := Socket[o_sock_ssl].Start_addr + len;
+
+      CC0_TCP := 0;
+      while Socket[o_sock_ssl].State_S = 2 do      // while connected
+        begin
+          if CC0_TCP > 49 then break; // fail in 4 sec
+          if Socket[o_sock_ssl].Start_addr = Socket[o_sock_ssl].Stop_addr then
+            begin
+              result := true;
+              exit;
+            end;
+          Do_EthernetProc;
+          Process_DHCP;
+        end;
+end;
+
+function SendTCPwait_SSL(len : word) : boolean;
+begin
+
+  Wait_With_Eth(100);
+
+  result := false;
+
+  if Socket[o_sock_ssl].State_S <> 2 then exit;
+
+      if UDP_debug <> 0 then
+        begin
+          Mem_Cpy(@Socket_TCP_buf,@HTTP_data_out,len);
+          out_broadcast(33335,len);
+        end;
+
+      Socket[o_sock_ssl].RAM_ROM := 0;
+      Socket[o_sock_ssl].Keep_Alive := true;
+      Socket[o_sock_ssl].Exp_Time_Val := 100;
+      Socket[o_sock_ssl].Do_Not_Fragment := 1;
+      Socket[o_sock_ssl].Start_addr := @HTTP_data_out;
+      Socket[o_sock_ssl].Stop_addr := Socket[o_sock_ssl].Start_addr + len;
+
+      host_response_len_ssl := 0;
+
+      CC0_TCP := 0;
+      while Socket[o_sock_ssl].State_S = 2 do      // while connected
+        begin
+          if CC0_TCP > 49 then break; // fail in 4 sec
+          if host_response_len_ssl <> 0 then
+            begin
+              result := true;
+              break;
+            end;
+          Do_EthernetProc;
+          Process_DHCP;
+        end;
+end;
+
+function Open_SSL(port : word) : boolean;
+var gen_i : byte;
+begin
+  result := false;
+  certificate_len := 0;
+  if OpenTCPConnection(port) <> 0 then
+    begin
+      Mem_Set(@HTTP_data_out,0,256);
+      HTTP_data_out[0] := $16;
+      HTTP_data_out[1] := $03;
+      HTTP_data_out[2] := $01;
+      HTTP_data_out[4] := $30;
+      HTTP_data_out[5] := $01;
+      HTTP_data_out[8] := $2b;
+      HTTP_data_out[9] := $03;
+      HTTP_data_out[10] := $02;
+      for gen_i := 11 to 42 do HTTP_data_out[gen_i] := Hi(Table16[Lo(TMR1+gen_i)]); // generate random
+      HTTP_data_out[46] := $04;
+      HTTP_data_out[48] := $2f;
+      HTTP_data_out[48] := $ff;
+      HTTP_data_out[52] := $01;
+      if SendTCPwait(53) <> 0 then
+        begin
+          Wait_With_Eth(500);
+          if UDP_debug <> 0 then
+            begin
+              Mem_Cpy(@Socket_TCP_buf,@host_response,host_response_len_ssl);
+              out_broadcast(33335,host_response_len_ssl);
+            end;
+          Mem_Cpy(@certificate,@host_response,host_response_len_ssl);
+          certificate_len := host_response_len_ssl;
+        end;
+      result := true;
+    end;
+end;
+
+end.
