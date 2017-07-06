@@ -13,6 +13,32 @@ function Open_SSL(port : word) : boolean;
 
 implementation
 
+procedure out_broadcast_local(port,len : word; var d_in : array[4096] of char);
+var broadcast_ip : array[4] of byte;
+var i,j : word;
+    buf : string[1300];
+begin
+  broadcast_ip[0] := 255;
+  broadcast_ip[1] := 255;
+  broadcast_ip[2] := 255;
+  broadcast_ip[3] := 255;
+
+  j := 0;
+  while len <> 0 do
+    begin
+      i := len;
+      if i > 1280 then i := 1280;
+
+      Mem_Cpy(@buf,@d_in[j],i);
+
+      Send_UDP_Broadcast(broadcast_ip,port,port,i,buf);
+      Do_EthernetProc;
+
+      j := j + i;
+      len := len - i;
+    end;
+end;
+
 procedure SSL_Init;
 begin
   HTTP_send_Port_ssl := TMR1 + 23456;
@@ -26,11 +52,11 @@ label next_;
 begin
   Socket[j].Keep_Alive := true;
 
-  if host_response_len_ssl >= 3072 then exit;
+  if host_response_len_ssl >= 4096 then exit;
 
   if host_response_len_ssl <> 0 then    // one packet arrived
     begin
-      max_len := 3072 - host_response_len_ssl;
+      max_len := 4096 - host_response_len_ssl;
       if len_ > max_len then len_ := max_len;
     end;
 
@@ -63,7 +89,7 @@ again_:
       if UDP_debug <> 0 then
         begin
           Socket_TCP_buf := 'DNS fail';
-          out_broadcast_string(33335);
+          out_broadcast_local(33335,Str_Len(Socket_TCP_buf),Socket_TCP_buf);
         end;
       goto end_end_;
     end;
@@ -105,8 +131,7 @@ begin
 
       if UDP_debug <> 0 then
         begin
-          Mem_Cpy(@Socket_TCP_buf,@HTTP_data_out,len);
-          out_broadcast(33335,len);
+          out_broadcast_local(33335,len,HTTP_data_out);
         end;
 
       Socket[o_sock_ssl].RAM_ROM := 0;
@@ -141,8 +166,7 @@ begin
 
       if UDP_debug <> 0 then
         begin
-          Mem_Cpy(@Socket_TCP_buf,@HTTP_data_out,len);
-          out_broadcast(33335,len);
+          out_broadcast_local(33335,len,HTTP_data_out);
         end;
 
       Socket[o_sock_ssl].RAM_ROM := 0;
@@ -173,29 +197,32 @@ var gen_i : byte;
 begin
   result := false;
   certificate_len := 0;
-  if OpenTCPConnection(port) <> 0 then
+  if OpenTCPConnection_SSL(port) <> 0 then
     begin
       Mem_Set(@HTTP_data_out,0,256);
       HTTP_data_out[0] := $16;
-      HTTP_data_out[1] := $03;
-      HTTP_data_out[2] := $01;
-      HTTP_data_out[4] := $30;
-      HTTP_data_out[5] := $01;
+      HTTP_data_out[1] := $03;  // TLS Version 1.1
+      HTTP_data_out[2] := $02;  // TLS Version 1.1
+      HTTP_data_out[4] := $2f;  // TLS_RSA_WITH_AES_128_CBC_SHA ciphersuite
+      HTTP_data_out[5] := $01;  // client hello
       HTTP_data_out[8] := $2b;
       HTTP_data_out[9] := $03;
       HTTP_data_out[10] := $02;
-      for gen_i := 11 to 42 do HTTP_data_out[gen_i] := Hi(Table16[Lo(TMR1+gen_i)]); // generate random
-      HTTP_data_out[46] := $04;
-      HTTP_data_out[48] := $2f;
-      HTTP_data_out[48] := $ff;
-      HTTP_data_out[52] := $01;
-      if SendTCPwait(53) <> 0 then
+	  // 32 random bytes
+      for gen_i := 11 to 42 do 
+	    HTTP_data_out[gen_i] := Hi(Table16[Lo(TMR1+gen_i)]); // generate random
+	   
+	  // ciphersuite list 
+      HTTP_data_out[45] := $04;
+      HTTP_data_out[47] := $2f;
+      HTTP_data_out[49] := $ff;
+      HTTP_data_out[50] := $01;
+      if SendTCPwait_SSL(52) <> 0 then
         begin
           Wait_With_Eth(500);
           if UDP_debug <> 0 then
             begin
-              Mem_Cpy(@Socket_TCP_buf,@host_response,host_response_len_ssl);
-              out_broadcast(33335,host_response_len_ssl);
+              out_broadcast_local(33335,host_response_len_ssl,host_response);
             end;
           Mem_Cpy(@certificate,@host_response,host_response_len_ssl);
           certificate_len := host_response_len_ssl;
