@@ -1,0 +1,427 @@
+unit unX509Certificate;
+
+uses dspic_additional_string_library;
+
+const OID_RSA = '1.2.840.113549.1.1.1';
+
+type TRSAKey = record
+    ExponentLength: word;
+    BaseLength: word;
+    Exponent: string[10];
+    Base: string[512];
+  end;
+  
+type TPublicKey = record
+  EncryptionMethod: string[1024];
+  Key: TRSAKey;
+end;
+
+type TX509Certificate = record
+  VersionNumber: byte;
+  SerialNumber: Array[12] of byte;
+  PublicKey: TPublicKey;
+end;
+
+// how to parse OID?
+type TOid = record
+    b: byte;
+  end;
+
+
+{
+        case 0x00: return "EOC";
+        case 0x01: return "BOOLEAN";
+        case 0x02: return "INTEGER";
+        case 0x03: return "BIT_STRING";
+        case 0x04: return "OCTET_STRING";
+        case 0x05: return "NULL";
+        case 0x06: return "OBJECT_IDENTIFIER";
+        case 0x07: return "ObjectDescriptor";
+        case 0x08: return "EXTERNAL";
+        case 0x09: return "REAL";
+        case 0x0A: return "ENUMERATED";
+        case 0x0B: return "EMBEDDED_PDV";
+        case 0x0C: return "UTF8String";
+        case 0x10: return "SEQUENCE";
+        case 0x11: return "SET";
+        case 0x12: return "NumericString";
+        case 0x13: return "PrintableString"; // ASCII subset
+        case 0x14: return "TeletexString"; // aka T61String
+        case 0x15: return "VideotexString";
+        case 0x16: return "IA5String"; // ASCII
+        case 0x17: return "UTCTime";
+        case 0x18: return "GeneralizedTime";
+        case 0x19: return "GraphicString";
+        case 0x1A: return "VisibleString"; // ASCII subset
+        case 0x1B: return "GeneralString";
+        case 0x1C: return "UniversalString";
+        case 0x1E: return "BMPString";
+}
+
+const ASN1_INTEGER = 0x02;
+      ASN1_BIT_STRING = 0x03;
+      ASN1_OCTET_STRING = 0x04;
+      ASN1_NULL = 0x05;
+      ASN1_OBJECT_IDENTIFIER = 0x06;
+      ASN1_SEQUENCE = 0x10;
+      ASN1_SET = 0x11;
+      ASN1_PRINTABLE_STRING = 0x13;
+      ASN1_T61_STRING = 0x14;
+      ASN1_IA5_STRING = 0x16;
+      ASN1_UTC_TIME = 0x17;
+      ASN1_ARRAY = 0xA0; // ???
+      ASN1_SEQUENCE0 = 0x30;
+      ASN1_SEQUENCE1 = 0x82;
+      ASN1_SET2 = 0x31;
+
+{
+   // certificate: 3082048030820368a00302010202080118f044a8f31892300d06092a864886f70d01010b05003049310b300906035504061302555331133011060355040a130a476f6f676c6520496e63312530230603550403131c476f6f676c6520496e7465726e657420417574686f72697479204732301e170d3137303632383130303734365a170d3137303932303039323730305a3068310b30090603550406130255533113301106035504080c0a43616c69666f726e69613116301406035504070c0d4d6f756e7461696e205669657731133011060355040a0c0a476f6f676c6520496e633117301506035504030c0e7777772e676f6f676c652e636f6d30820122300d06092a864886f70d01010105000382010f003082010a028201010091dff81002c2995336dcca38bdfd9010a7ffb4839240e23a379542abbe9c99e3eaaee0cd4556fe21dd3b7544f205bb59f0528bb35f11457d3467ae620dc614ae258fa99900c7c8ac4396c42d87546bde207404d5f97e95eef056d6a20615385b6d4a243e112ba356345af7d535f94947404ad9397dc87cdcbd1d0a7c3acce31025bd3dc881bc82b60dcdc405334b04c9a04cb6a537f81f51175c5040c6f2aff26adc6242783fcba8c99ac8ff64e6e0f33febf9f3b92bc9f3ddf7601665281a0e7eb361f900a06f4e68000e3df4a60dcf9177147d3064a393446a0c0b4cc1173669fb9e7b3b6ba1e800e904ae5b5135937b7d4d0e5ec8207d1627f30614318bd50203010001a382014b30820147301d0603551d250416301406082b0601050507030106082b0601050507030230190603551d1104123010820e7777772e676f6f676c652e636f6d306806082b06010505070101045c305a302b06082b06010505073002861f687474703a2f2f706b692e676f6f676c652e636f6d2f47494147322e637274302b06082b06010505073001861f687474703a2f2f636c69656e7473312e676f6f676c652e636f6d2f6f637370301d0603551d0e0416041488ff2868f35d98c97375b7828d64c8edd30e7b2a300c0603551d130101ff04023000301f0603551d230418301680144add06161bbcf668b576f581b6bb621aba5a812f30210603551d20041a3018300c060a2b06010401d6790205013008060667810c01020230300603551d1f042930273025a023a021861f687474703a2f2f706b692e676f6f676c652e636f6d2f47494147322e63726c300d06092a864886f70d01010b0500038201010034405825d54c19d6f2467823a19aff53eb69b7b9b83ae6ecb9d621883a371be0e0e918e81ec8585eb801652af3423bfdc86f2a74b649d175a8ee6f989dcb6cbde5d2845b720d95baf76b52a16f381bc2a4d04dd1578ad927623c112e106afa34a24e8072205ac02587ffc27438f6549425f49e4cb7e696897c69e403b7cfba7d59ea92bd8d4f6aed5fe259318fc5f2ee37e86cff3566fa13daeb14c1c70ae21151deeda63f90751c453a62cbf3aeb8d07593d1efca98262a88827dd08850b7130b1f802f8321c1feb71559aa34d97730221a24c78b624d35d186b1dc22721e346edcac5baef3c430f6a2f160ee54838fbd93805746ed38c339369a96f8482520
+  0x3082   - <Sequence delimiter>
+     04 80 - <sequence length 0x480 bytes>
+  0x3082  - <Sequence delimiter>
+     03 68 - <sequence length 0x368 bytes>
+  0xa0 03      - next three bytes are...
+    0x02 01    - integer  of length 1 byte
+      0x02       - integer value, version number in this case
+    02 08      - integer of length 8 bytes
+      01 18 f0 44 a8 f3 18 92 - integer value, certificate serial number  = 79077171161929874 in decimal
+    30 0d      - ?
+    06 09      - object identfier of the length of nine bytes
+      2a 86 48 86 f7 0d 01 01 0b
+}
+
+function DecodeCertificate(var certificate: string[4096]; var outCertificate: TX509Certificate; var startIndex: word): boolean;
+procedure X509Init();
+
+implementation
+
+var stateMachine: byte;
+    oidRSA: string[24];
+
+procedure X509Init();
+var i: byte;
+begin
+  stateMachine := 1;
+
+  //**** specific oid
+  for i := 0 to 19 do
+    oidRSA[i] := OID_RSA[i];
+  oidRSA[20] := 0;
+  //**
+end;
+
+function ASNDecOIDItem(var Start: word; var Buffer: string): dword;
+var
+  x: byte;
+  proceed: Boolean;
+begin
+  Result := 0;
+  repeat
+    Result := Result * 128;
+    x := Ord(Buffer[Start]);
+    Inc(Start);
+    proceed := x > $7F;
+    x := x and $7F;
+    Result := Result + x;
+  until proceed = false;
+end;
+
+function IdToMib(var Id: string): string[64];
+var
+  x, y, n: dword;
+  len: word;
+  tmp: string[10];
+begin
+  Result := '';
+  n := 0;
+  len := Str_Len(Id);
+  while len  > n do
+  begin
+    x := ASNDecOIDItem(n, Id);
+    if n = 1 then
+    begin
+      y := x div 40;
+      x := x mod 40;
+      Byte2Str(y, Result);
+    end;
+    Result := Result + '.';
+    LongWord2Str(x, tmp);
+    Result := Result + tmp;
+  end;
+end;
+
+
+// convert hex number at index to a number
+function getByteInternal(var certificate: string[4096]; index: word): byte;
+var hexValue: array[4] of char;
+begin
+  index := index * 2;
+  hexValue[0] := 0;
+  hexValue[1] := 0;
+  hexValue[2] := 0;
+  hexValue[3] := 0;
+
+  hexValue[0] := certificate[index];
+  inc(index);
+  hexValue[1] := certificate[index];
+
+  result := Hex2Byte(hexValue);
+end;
+
+// convert hex number at index to a number                            // maximum 4 bytes
+function getBytesInternal(var certificate: string[4096]; index: word; numOfBytes: byte): word;
+var hexValue: array[4] of char;
+    i: byte;
+begin
+  index := index * 2;
+  hexValue[0] := 0;
+  hexValue[1] := 0;
+  hexValue[2] := 0;
+  hexValue[3] := 0;
+
+  for i := 0 to numOfBytes - 1 do
+    begin
+      hexValue[i] := certificate[index];
+      inc(index);
+    end;
+
+  result := Hex2Word(hexValue);
+end;
+
+{
+  state machine
+    state
+      0 - start
+      1 - looking for version number
+      2 - looking for serial number
+      3 - wait for encryption algorithm
+      4 - wait for public key base
+      5 - wait for public key exponent
+
+}
+
+function DecodeCertificate(var certificate: string[4096]; var outCertificate: TX509Certificate; var startIndex: word): boolean;
+var j: word;
+    octetLength, length : word;
+    currentByte, nextByte: byte;
+    value: byte;
+    totalLength: word;
+    oid: string[64];
+    oidText: string[64];
+    printableString: string[64];
+    parsedBytes: word;
+begin
+  result := false; // error occured
+  totalLength := Str_Len(certificate);
+  //i := startIndex;
+
+  //repeat
+    begin
+      currentByte := getByteInternal(certificate, startIndex);
+      case currentByte of
+        ASN1_NULL: //
+          begin
+            inc(startIndex); // null
+            inc(startIndex); // next tag
+          end;
+        ASN1_SET, ASN1_SET2: //
+          begin
+            inc(startIndex);
+            length := getByteInternal(certificate, startIndex);
+            inc(startIndex); // next tag
+          end;
+        ASN1_SEQUENCE0: //
+          begin
+            nextByte := getByteInternal(certificate, startIndex + 1);
+            if nextByte = ASN1_SEQUENCE1 then
+              begin
+                 // sequence delimiter detected
+                 inc(startIndex); // move to next byte of sequence start
+                 inc(startIndex); // move to next ASN1 tag
+                 length := getBytesInternal(certificate, startIndex, 4); // 4 hexadecimal characters = two bytes
+                 // we have the sequence length, loop through it
+                 inc(startIndex); // length of sequence is two bytes
+                 inc(startIndex);
+                 while length > 0 do
+                  begin
+                    parsedBytes := startIndex;
+                    DecodeCertificate(certificate, outCertificate, startIndex);
+                    parsedBytes := startIndex - parsedBytes;
+                    if length > parsedBytes then
+                      length := length - parsedBytes
+                    else
+                      length := 0;
+                  end;
+              end
+            else // just a sequence
+              begin
+                inc(startIndex);
+                length := getByteInternal(certificate, startIndex); // only one byte of length
+                // we have the sequence length, loop through it
+                inc(startIndex); // length of sequence is one byte now
+                while length > 0 do
+                  begin
+                    parsedBytes := startIndex;
+                    DecodeCertificate(certificate, outCertificate, startIndex);
+                    parsedBytes := startIndex - parsedBytes;
+                    if length > parsedBytes then
+                      length := length - parsedBytes
+                    else
+                      length := 0;
+                  end;
+              end;
+          end;  // asn1 sequence start
+        ASN1_OBJECT_IDENTIFIER: //
+          begin
+            inc(startIndex);
+            length := getByteInternal(certificate, startIndex);
+            inc(startIndex);
+            // now we have the length of the oid, let's store it
+            for j := 0 to 63 do
+              oid[j] := 0;
+            for j := 1 to length do
+              begin
+                oid[j-1] := getByteInternal(certificate, startIndex);
+                inc(startIndex);
+              end;
+            
+            // oid is detected, check which one it is
+            oidText := IdToMib(oid);
+            nop;
+            
+            if stateMachine = 3 then // waiting for encryption
+              begin
+                if str_Cmp(oidText, oidRSA) = 0 then
+                  begin
+                    length := Str_Len(oidText);
+                    for j := 0 to length - 1 do
+                      outCertificate.PublicKey.EncryptionMethod[j] := oidText[j];
+                    outCertificate.PublicKey.EncryptionMethod[length] := 0; // zero terminator
+                    nop;
+                    stateMachine := 4; // wait for public key base and exponent
+                  end;
+              end;
+              
+          end;
+        ASN1_PRINTABLE_STRING: //
+          begin
+            inc(startIndex);
+            length := getByteInternal(certificate, startIndex);
+            printableString[0] := 0;
+            for j := 1 to length do
+              begin
+                printableString[j-1] := certificate[startIndex];
+                inc(startIndex);
+              end;
+          end;
+        ASN1_BIT_STRING: //
+          begin
+            // TLV byte triplet
+            //  T - 0x03, 1 byte
+            //  L - length, 1 byte + as many as it follows
+            //  V - number of bits left unused
+            // example: 03   82 01 0F   00
+            //           T     L        V
+            // 82 = 1000 0010
+            //      ^      ^___ trailing length bytes, in this case 2 bytes that follow are the length
+            //      |__________ there are more than 127 bytes
+            
+            inc(startIndex); // skip T
+            octetLength := getByteInternal(certificate, startIndex);  // bit string length
+            octetLength := octetLength and 0x7F; // strip the first bit
+            // octet length now says how many bytes is the actual length
+            inc(startIndex);
+            length := getBytesInternal(certificate, startIndex, octetLength); // TODO: let's hope there are no more than 2 bytes
+            for j := 1 to octetLength do
+              inc(startIndex);
+
+            inc(startIndex); // skip V
+            DecodeCertificate(certificate, outCertificate, startIndex);
+            //startIndex := startIndex + octetLength;
+            //inc(startIndex); // next tag
+          end;
+        ASN1_OCTET_STRING: //
+          begin
+            inc(startIndex);
+            octetLength := getByteInternal(certificate, startIndex);
+            {
+              do something with octet length
+            }
+            inc(startIndex); // next tag
+          end; // octet string
+        ASN1_ARRAY: //
+          begin
+             inc(startIndex);
+             length := getByteInternal(certificate, startIndex);
+             inc(startIndex);
+             //for j := 1 to length do
+               begin
+             //    DecodeCertificate(certificate, outCertificate, startIndex);
+                 //inc(startIndex);
+               end;
+             //inc(startIndex); // next tag
+          end; // array
+        ASN1_INTEGER: //
+          begin
+             inc(startIndex);
+             length := getByteInternal(certificate, startIndex);
+             if length and 0x80 = 0x80 then // more than 127 bytes?
+               begin
+                 octetLength := length and 0x7F;
+                 inc(startIndex);
+                 length := getBytesInternal(certificate, startIndex, octetLength * 2);
+                 for j := 1 to octetLength - 1 do // note: -1 because there is another increment in the for loop below
+                   Inc(startIndex);
+               end;
+             for j := 1 to length do
+               begin
+                 inc(startIndex); // move to value
+                 value := getByteInternal(certificate, startIndex);
+                 case stateMachine of
+                    1: // waiting for version number
+                      begin
+                        outCertificate.VersionNumber := value;
+                        stateMachine := 2;
+                      end;
+                    2: // waiting for the version number
+                      begin
+                        outCertificate.SerialNumber[j-1] := value;
+                        if j = length then // done here, move to next state, get encryption and public key
+                          begin
+                            stateMachine := 3;
+                          end;
+                      end;
+                     4: // waiting for the public key base
+                      begin
+                        outCertificate.PublicKey.Key.Base[j-1] := value;
+                        if j = length then // done here, move to next state, get encryption and public key
+                          begin
+                            stateMachine := 5; // wait for the PK exponent
+                            outCertificate.PublicKey.Key.BaseLength := length;
+                          end;
+                      end;
+                    5: // waiting for the public key exponent
+                      begin
+                        outCertificate.PublicKey.Key.Exponent[j-1] := value;
+                        if j = length then // done here, move to next state, get encryption and public key
+                          begin
+                            stateMachine := 6; // key done
+                            outCertificate.PublicKey.Key.ExponentLength := length;
+                          end;
+                      end;
+                 end; // case of stateMachine
+               end;
+            inc(startIndex); // next tag
+          end // end case of integer
+          
+        else // everything else
+          begin
+            inc(startIndex);
+          end;
+      end; // case
+    end;
+  //until i >= totalLength;
+end;
+
+
+end.
