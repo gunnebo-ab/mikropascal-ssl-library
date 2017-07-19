@@ -2,8 +2,13 @@ unit ssl_tsl;
 
 uses dspic_additional_string_library,lib_Delays_LIO,def_io,lib1_enc600_V3_5_b,
      enc_lib_user,lib2_enc600_V3_5_b,df_lib_SPI1,crc16_lib,
-     Tftp_Server,config,HTTP_Send;
+     Tftp_Server,config,HTTP_Send,definitions_ENC600,unX509Certificate;
 
+procedure Random_Init;
+procedure MD5SHA(d_in : ^char; len : word; d_out : ^byte; hashop,md5_sha : byte);
+procedure HMAC_MD5SHA(key : ^char; key_len : word; text : ^char; text_len : word; hmac : ^char; md5_sha : byte);
+procedure AES_128_CBC_encrypt(key16,iv16,text : ^char; text_len : word);
+procedure AES_128_CBC_decrypt(key16,iv16,text : ^char; text_len : word);
 procedure SSL_Init;
 procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
 function OpenTCPConnection_SSL(port : word) : boolean;
@@ -12,6 +17,264 @@ function SendTCPwait_SSL(len : word) : boolean;
 function Open_SSL(port : word) : boolean;
 
 implementation
+
+var m_z,m_w,m_r : dword;
+
+procedure Random_Init;
+begin
+  LoWord(m_z) := TMR1;
+  HiWord(m_z) := TMR1+127;
+  LoWord(m_w) := TMR1+369;
+  HiWord(m_w) := TMR1+768;
+end;
+
+function Random : dword;
+begin
+  m_z := 36969 * (m_z and 65535) + (m_z shr 16);
+  m_w := 18000 * (m_w and 65535) + (m_w shr 16);
+  result := (m_z shl 16) + m_w;
+end;
+
+procedure Random_Array(d_in : ^byte);
+var i : word;
+begin
+  i := 0;
+  while i < 8 do
+    begin
+      m_r := Random;
+      d_in^ := Lo(m_r);
+      inc(d_in);
+      d_in^ := Hi(m_r);
+      inc(d_in);
+      d_in^ := Higher(m_r);
+      inc(d_in);
+      d_in^ := Highest(m_r);
+      inc(d_in);
+      inc(i);
+    end;
+end;
+
+procedure dma_write(addr : word; d_in : ^char; len : word);
+begin
+  CopyRamToEthMem(d_in, $680, len);
+  CopyEthMemToEthMem($680,addr,len);
+end;
+
+procedure dma_read(addr : word; d_out : ^char; len : word);
+begin
+  CopyEthMemToEthMem(addr,$680,len);
+  CopyEthMemToRam($680,d_out,len);
+end;
+
+var MD5_buff : array[28] of byte;
+
+procedure MD5SHA(d_in : ^char; len : word; d_out : ^byte; hashop,md5_sha : byte);
+var i : word;
+    buf : word;
+begin
+  buf := Eth_ReadReg(ECON2_);
+  if md5_sha = 0 then 
+    begin
+      buf.12 := 0;           // MD5
+      md5_sha := 16;
+    end
+  else    
+    begin
+      buf.12 := 1;           // SHA1
+      md5_sha := 20;
+    end;
+  Eth_WriteReg(ECON2_, buf);
+  if hashop <> 0 then dma_write(0x7A40, @MD5_buff, 28);
+  buf := Eth_ReadReg(ECON1_);
+  if hashop = 0 then buf.13 := 0           // HASHOP
+  else buf.13 := 1;           // HASHOP;
+  buf.12 := 0;           // HASHLST
+  buf.14 := 1;           // HASHEN
+  Eth_WriteReg(ECON1_, buf);
+  i := 0;
+  while len > 64 do
+    begin
+      buf := Eth_ReadReg(EIR_);
+      buf.13 := 0;           // HASHIF
+      Eth_WriteReg(EIR_, buf);
+      dma_write(0x7A00, d_in + i, 64);
+      while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
+      len := len - 64;
+      i := i + 64;
+    end;
+  dma_read(0x7A70, @MD5_buff, 28);
+  buf := Eth_ReadReg(ECON1_);
+  buf.12 := 1;           // HASHLST
+  Eth_WriteReg(ECON1_, buf);
+  buf := Eth_ReadReg(EIR_);
+  buf.13 := 0;           // HASHIF
+  Eth_WriteReg(EIR_, buf);
+  dma_write(0x7A00, d_in + i, len);
+  while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
+  dma_read(0x7A70, d_out, md5_sha);
+  buf := Eth_ReadReg(ECON1_);
+  buf.14 := 0;           // HASHEN
+  Eth_WriteReg(ECON1_, buf);
+end;
+
+procedure HMAC_MD5SHA(key : ^char; key_len : word; text : ^char; text_len : word; hmac : ^char; md5_sha : byte);
+var ipad,opad : array[65] of char;
+    i : word;
+begin
+   if key_len > 64 then
+     begin
+       MD5SHA(key,key_len,key,0,md5_sha);
+       if md5_sha = 0 then key_len := 16
+       else key_len := 20;
+     end;
+   Mem_Set(@ipad, 0x36, 64);
+   Mem_Set(@opad, 0x5c, 64);
+   i := 0;
+   while i < key_len do
+     begin
+       ipad[i] := ipad[i] xor key^;
+       opad[i] := opad[i] xor key^;
+       inc(i);
+       inc(key);
+      end;
+   MD5SHA(@ipad,65,@ipad,0,md5_sha);      // we use one dummy byte at the end of ipad
+   MD5SHA(text,text_len,hmac,1,md5_sha);
+   MD5SHA(@opad,65,@opad,0,md5_sha);      // we use one dummy byte at the end of opad
+   if md5_sha = 0 then i := 16
+   else i := 20;
+   MD5SHA(hmac,i,hmac,1,md5_sha);
+end;
+
+procedure AES_128_CBC_encrypt(key16,iv16,text : ^char; text_len : word);
+var blocks,i,buf : word;
+begin
+  if (text_len mod 16) = 0 then nop else exit;
+   
+  blocks := text_len div 16;
+
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for AES engine to be free...
+
+  buf := Eth_ReadReg(ECON2_);
+  buf.0 := 0;           // AESLEN 128-bit key
+  buf.1 := 0;           // AESLEN 128-bit key
+  Eth_WriteReg(ECON2_, buf);
+
+  dma_write(0x7C00, key16, 16);
+  
+  buf := Eth_ReadReg(ECON1_);
+  buf.11 := 1;           // AESST
+  Eth_WriteReg(ECON1_, buf);
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for key to be loaded
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.9 := 1;           // AESOP CBC encrypt
+  buf.10 := 0;           // AESOP CBC encrypt
+  Eth_WriteReg(ECON1_, buf);
+
+  dma_write(0x7C20, iv16, 16);
+
+  i := 0;
+  while i < blocks do
+    begin
+      // write the next block ...
+      dma_write(0x7C30, text + i*16, 16);
+      buf := Eth_ReadReg(ECON1_);
+      buf.11 := 1;           // AESST start encryption
+      Eth_WriteReg(ECON1_, buf);
+      while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for completion
+      dma_read(0x7C20, text + i*16, 16);
+      inc(i);
+  end;
+end;
+
+procedure AES_128_CBC_decrypt(key16,iv16,text : ^char; text_len : word);
+var blocks,i,buf : word;
+begin
+  if (text_len mod 16) = 0 then nop else exit;
+
+  blocks := text_len div 16;
+
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for AES engine to be free...
+
+  buf := Eth_ReadReg(ECON2_);
+  buf.0 := 0;           // AESLEN 128-bit key
+  buf.1 := 0;           // AESLEN 128-bit key
+  Eth_WriteReg(ECON2_, buf);
+   
+  dma_write(0x7C00, key16, 16);
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.11 := 1;           // AESST
+  Eth_WriteReg(ECON1_, buf);
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for key to be loaded
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.9 := 0;           // AESOP CBC decrypt
+  buf.10 := 1;          // AESOP CBC decrypt
+  Eth_WriteReg(ECON1_, buf);
+
+  dma_write(0x7C30, iv16, 16);
+
+  i := 0;
+  while i < blocks do
+    begin
+      // write the next block ...
+      dma_write(0x7C20, text + i*16, 16);
+      buf := Eth_ReadReg(ECON1_);
+      buf.11 := 1;           // AESST start decryption
+      Eth_WriteReg(ECON1_, buf);
+      while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for completion
+      dma_read(0x7C40, text + i*16, 16);
+      CopyEthMemToEthMem(0x7C40,0x7C30,16);
+      inc(i);
+    end;
+end;
+
+procedure modexp(var y : array[128] of byte;
+                 var e : array[128] of byte; e_len : word;
+                 var x : array[128] of byte; x_len : word;
+                 var m : array[128] of byte; m_len : word);
+var buf : array[128] of byte;
+    buf1 : word;
+begin
+  // Only 512, 768, and 1024 bit moduli are supported
+  if (m_len <> 64) and (m_len <> 96) and (m_len <> 128) then exit;
+
+  // e and x must be strictly less than m
+  if (e_len > m_len) or (x_len > e_len) then exit;
+
+{ datasheet 15.1
+      "For the Modular Exponentiation engine to work correctly, the
+      Most Significant (MSb) bit of M must be set."
+}
+
+  if (m[0] and 0x80) = 0 then exit;
+
+  // left-pad e, x with zeros
+  Mem_Set(@buf, 0, m_len);
+  Mem_Cpy(@buf + m_len - e_len, @e, e_len);
+  dma_write(0x7800, @buf, m_len);
+
+  Mem_Set(@buf, 0, m_len);
+  Mem_Cpy(@buf + m_len - x_len, @x, x_len);
+  dma_write(0x7880, @buf, m_len);
+
+  dma_write(0x7900, @m, m_len);
+  
+  buf1 := Eth_ReadReg(ECON2_);
+  buf1.2 := 0;                              // MODLEN 64
+  buf1.3 := 0;                              // MODLEN 64
+  if m_len = 96 then buf1.2 := 1            // MODLEN 96
+  else if m_len = 128 then buf1.3 := 1;     // MODLEN 128
+  Eth_WriteReg(ECON2_, buf1);
+  
+  buf1 := Eth_ReadReg(ECON1_);
+  buf1.15 := 1;           // MODEXST enable modexp engine
+  Eth_WriteReg(ECON1_, buf1);
+  while (Eth_ReadReg(ECON1_) and $8000) <> 0 do delayms(1);
+
+  dma_read(0x7880, @y, m_len);
+end;
 
 procedure out_broadcast_local(port,len : word; var d_in : array[4096] of char);
 var broadcast_ip : array[4] of byte;
@@ -193,7 +456,6 @@ begin
 end;
 
 function Open_SSL(port : word) : boolean;
-var gen_i : byte;
 begin
   result := false;
   certificate_len := 0;
@@ -201,18 +463,14 @@ begin
     begin
       Mem_Set(@HTTP_data_out,0,256);
       HTTP_data_out[0] := $16;
-      HTTP_data_out[1] := $03;  // TLS Version 1.1
-      HTTP_data_out[2] := $02;  // TLS Version 1.1
-      HTTP_data_out[4] := $2f;  // TLS_RSA_WITH_AES_128_CBC_SHA ciphersuite
-      HTTP_data_out[5] := $01;  // client hello
+      HTTP_data_out[1] := $03;
+      HTTP_data_out[2] := $02;
+      HTTP_data_out[4] := $2f;
+      HTTP_data_out[5] := $01;
       HTTP_data_out[8] := $2b;
       HTTP_data_out[9] := $03;
       HTTP_data_out[10] := $02;
-	  // 32 random bytes
-      for gen_i := 11 to 42 do 
-	    HTTP_data_out[gen_i] := Hi(Table16[Lo(TMR1+gen_i)]); // generate random
-	   
-	  // ciphersuite list 
+      Random_Array(@HTTP_data_out[11]);
       HTTP_data_out[45] := $04;
       HTTP_data_out[47] := $2f;
       HTTP_data_out[49] := $ff;
