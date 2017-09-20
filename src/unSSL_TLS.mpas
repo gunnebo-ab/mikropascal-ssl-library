@@ -1,0 +1,899 @@
+unit unSSL_TLS;
+
+uses dspic_additional_string_library,lib_Delays_LIO,def_io,lib1_enc600_V3_5_b,
+     enc_lib_user,lib2_enc600_V3_5_b,df_lib_SPI1,crc16_lib,
+     Tftp_Server,config,HTTP_Send,definitions_ENC600,unX509Certificate;
+
+procedure Random_Init;
+procedure Random_Array_32(d_in : ^byte);
+//procedure MD5SHA_old(d_in : ^char; len : word; d_out : ^byte; hashop,md5_sha : byte);
+procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
+                   , restoreContextID // 0 - none
+                                      // 1 - SHA 1
+                                      // 2 - MD5
+                   , saveContextID    // 0 - none
+                                      // 1 - SHA 1
+                                      // 2 - MD5
+                   : byte);
+procedure MD5SHAFinal(dataIn, dataOut : ^char; dataLength : word; shaMd5, contextID: byte);
+procedure HMAC_MD5SHA(key : ^char; key_len : word; text : ^char; text_len : word; hmac : ^char; md5_sha : byte);
+procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
+procedure AES_128_CBC_decrypt(key16, iv16, text : ^char; text_len : word);
+procedure modexp(var y : array[128] of byte;
+                 var e : array[128] of byte; e_len : word;
+                 var x : array[128] of byte; x_len : word;
+                 var m : array[128] of byte; m_len : word);
+procedure SSL_Init;
+procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
+function OpenTCPConnection_SSL(port : word) : boolean;
+function SendTCP_SSL(len : word) : boolean;
+function SendTCPwait_SSL(len : word) : boolean;
+function Open_SSL(port : word) : boolean;
+
+const HASHLST = 12;   // ECON1
+      HASHOP  = 13;   // ECON1
+      HASHEN  = 14;   // ECON1
+      SHA1MD5 = 12;   // ECON2
+      HASHIF  = 13;   // EIR
+
+implementation
+
+type TtoHash = record
+  hashed: boolean;           // indicates if dataIn is hashed
+  firstBlock: boolean;       // if set, then hash engine is reset
+  dataLength: byte;          // current length of dataIn
+  dataIn: array[64] of byte; // data to be hashed
+end;
+
+var m_z,m_w,m_r : dword;
+var MD5_buff, SHA1_buff : array[28] of byte;
+var toHashMD5, toHashSHA1: TtoHash;
+var ServerCertificate: TX509Certificate;
+
+
+
+procedure Random_Init;
+begin
+  LoWord(m_z) := TMR1;
+  HiWord(m_z) := TMR1+127;
+  LoWord(m_w) := TMR1+369;
+  HiWord(m_w) := TMR1+768;
+end;
+
+function Random : dword;
+begin
+  m_z := 36969 * (m_z and 65535) + (m_z shr 16);
+  m_w := 18000 * (m_w and 65535) + (m_w shr 16);
+  result := (m_z shl 16) + m_w;
+end;
+
+procedure AnalyzeRandom;
+begin
+  m_r := Random;
+  while ((Lo(m_r) = 0) or (Hi(m_r) = 0) or (Higher(m_r) = 0) or (Highest(m_r) = 0)) do m_r := Random;
+end;
+
+procedure Random_Array_32(d_in : ^byte);
+var i : word;
+begin
+  i := 0;
+  while i < 8 do
+    begin
+      AnalyzeRandom;
+      d_in^ := Lo(m_r);
+      inc(d_in);
+      d_in^ := Hi(m_r);
+      inc(d_in);
+      d_in^ := Higher(m_r);
+      inc(d_in);
+      d_in^ := Highest(m_r);
+      inc(d_in);
+      inc(i);
+    end;
+end;
+
+procedure dma_write(addr : word; d_in : ^char; len : word);
+begin
+  CopyRamToEthMem(d_in, $680, len);
+  CopyEthMemToEthMem($680,addr,len);
+end;
+
+procedure dma_read(addr : word; d_out : ^char; len : word);
+begin
+  CopyEthMemToEthMem(addr,$680,len);
+  CopyEthMemToRam($680,d_out,len);
+end;
+
+
+
+procedure MD5SHA_Final(d_in : ^char; len : word; d_out : ^byte; hashop, md5_sha : byte);
+begin
+end;
+
+procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
+                   , restoreContextID // 0 - none
+                                      // 1 - SHA 1
+                                      // 2 - MD5
+                   , saveContextID    // 0 - none
+                                      // 1 - SHA 1
+                                      // 2 - MD5
+                   : byte);
+var i : word;
+    buf : word;
+begin
+  buf := Eth_ReadReg(ECON2_);
+  if shaMd5 = 1 then
+    begin
+      buf.SHA1MD5 := 0;           // MD5
+      shaMd5 := 16;
+    end
+  else
+    begin
+      buf.SHA1MD5 := 1;           // SHA1
+      shaMd5 := 20;
+    end;
+  Eth_WriteReg(ECON2_, buf);
+  
+  buf := Eth_ReadReg(ECON1_);
+
+  if restoreContextID = 1 then
+    begin
+      dma_write(0x7A40, @MD5_buff, 28);
+      buf.HASHOP := 1; // continue prev hash
+    end
+  else if restoreContextID = 2 then
+    begin
+      dma_write(0x7A40, @SHA1_buff, 28);
+      buf.HASHOP := 1; // continue prev hash
+    end
+  else
+    begin
+      buf.HASHOP := 0; // begin a new hash
+    end;
+
+  buf.HASHEN := 1;
+  i := 0;
+  if dataLength > 64 then
+    begin
+      buf.HASHLST := 0;           // HASHLST
+
+      Eth_WriteReg(ECON1_, buf);
+      while dataLength > 64 do
+        begin
+          //UART3_Write_Text('Here 1.');
+          buf := Eth_ReadReg(EIR_);
+          buf.HASHIF := 0;           // HASHIF
+          Eth_WriteReg(EIR_, buf);
+          dma_write(0x7A00, dataIn + i, 64);
+          while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
+          dataLength := dataLength - 64;
+          i := i + 64;
+        end;
+
+      if saveContextID = 1 then
+        dma_read(0x7A70, @MD5_buff, 28)
+      else if saveContextID = 2 then
+        dma_read(0x7A70, @SHA1_buff, 28);
+    end;
+
+    
+  buf := Eth_ReadReg(ECON1_);
+  buf.HASHEN := 0;           // HASHEN
+  Eth_WriteReg(ECON1_, buf);
+end;
+
+procedure MD5SHAFinal(dataIn, dataOut : ^char; dataLength : word; shaMd5, restoreContextID: byte);
+var buf : word;
+begin
+  buf := Eth_ReadReg(ECON2_);
+  if shaMD5 = 1 then // MD5
+    shaMD5 := 16
+  else
+    shaMD5 := 20;
+  Eth_WriteReg(ECON2_, buf);
+  
+  buf := Eth_ReadReg(ECON1_);
+  if restoreContextID = 1 then
+    begin
+      dma_write(0x7A40, @MD5_buff, 28);
+      buf.HASHOP := 1; // continue prev hash
+    end
+  else if restoreContextID = 2 then
+    begin
+      dma_write(0x7A40, @SHA1_buff, 28);
+      buf.HASHOP := 1; // continue prev hash
+    end
+  else
+    begin
+      buf.HASHOP := 0; // begin a new hash
+    end;
+  
+  buf.HASHEN := 1;
+  buf.HASHLST := 1;
+  Eth_WriteReg(ECON1_, buf);
+  
+  buf := Eth_ReadReg(EIR_);
+  buf.HASHIF := 0;
+  Eth_WriteReg(EIR_, buf);
+  
+  if dataLength > 0 then  // must be <= 64
+    begin
+      dma_write(0x7A00, dataIn, dataLength);
+      while (Eth_ReadReg(EIR_) and $2000) = 0 do // HASHIF
+        delayms(1);
+    end;
+  dma_read(0x7A70, dataOut, shaMD5);
+  buf := Eth_ReadReg(ECON1_);
+  buf.HASHEN := 0;
+  Eth_WriteReg(ECON1_, buf);
+end;
+
+
+//******************************************************************************
+//
+//
+//
+//******************************************************************************
+procedure AddToHash(hashByte: byte; ShaMD5: byte);
+var save, restore: byte;
+begin
+  if ShaMD5 = 0 then
+    begin
+      toHashSHA1.dataIn[toHashSHA1.dataLength] := hashByte;
+      toHashSHA1.dataLength := toHashSHA1.dataLength + 1;
+      if (toHashSHA1.dataLength >= 64) then
+        begin // hash the current block
+
+        end;
+    end
+  else
+    begin
+      toHashMD5.dataIn[toHashMD5.dataLength] := hashByte;
+      toHashMD5.dataLength := toHashMD5.dataLength + 1;
+      if (toHashMD5.dataLength >= 64) then
+        begin // hash the current block
+          save := 2; // always save the context
+          if toHashMD5.firstBlock <> 0 then
+            begin // we do not restore on the first block
+              restore := 0;
+            end
+          else
+            begin
+              restore := 2;
+            end;
+          MD5SHA(@toHashMD5.dataIn[0], // data to be hashed
+                 65,                   // 64B actually, but the extra one will trigger a proper procedure
+                 save,                 // context
+                 restore,              // context
+                 1                  ); // MD5
+          toHashMD5.dataLength := 0;   // prepare for next block
+          toHashMD5.hashed := true;    // not really needed?
+        end;
+    end;
+end;
+
+procedure MD5SHA_old(d_in : ^char; len : word; d_out : ^byte; hashop, md5_sha : byte);
+var i : word;
+    buf : word;
+    ptr: ^byte;
+begin
+  ptr^ := @d_out;
+  buf := Eth_ReadReg(ECON2_);
+  if md5_sha = 0 then
+    begin
+      buf.12 := 0;           // MD5
+      md5_sha := 16;
+    end
+  else
+    begin
+      buf.12 := 1;           // SHA1
+      md5_sha := 20;
+    end;
+  Eth_WriteReg(ECON2_, buf);
+  buf := Eth_ReadReg(ECON1_);
+
+  if hashop <> 0 then // continue prev hash
+    begin
+      dma_write(0x7A40, @MD5_buff, 28);
+      buf.13 := 1;           // HASHOP;
+    end
+  else // begin a new hash
+    begin
+      buf.13 := 0;           // HASHOP
+    end;
+
+  buf.14 := 1;           // HASHEN
+  i := 0;
+  if len >= 64 then
+    begin
+      buf.12 := 0;           // HASHLST
+
+      Eth_WriteReg(ECON1_, buf);
+      while len > 64 do
+        begin
+          //UART3_Write_Text('Here 1.');
+          buf := Eth_ReadReg(EIR_);
+          buf.13 := 0;           // HASHIF
+          Eth_WriteReg(EIR_, buf);
+          dma_write(0x7A00, d_in + i, 64);
+          while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
+          len := len - 64;
+          i := i + 64;
+        end;
+      dma_read(0x7A70, @MD5_buff, 28);
+    end
+  else
+    begin
+      buf.12 := 1;           // HASHLST
+      Eth_WriteReg(ECON1_, buf);
+    end;
+ 
+  if len > 0 then
+    begin
+     // UART3_Write_Text('Here 2.');
+      ptr^ := ptr^ + i;
+      dma_write(0x7A00, d_in + i, len);
+      while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
+    end;
+  dma_read(0x7A70, d_out, md5_sha);
+  buf := Eth_ReadReg(ECON1_);
+  buf.14 := 0;           // HASHEN
+  Eth_WriteReg(ECON1_, buf);
+end;
+
+procedure HMAC_MD5SHA(key : ^char; key_len : word; text : ^char; text_len : word; hmac : ^char; md5_sha : byte);
+var ipad,opad : array[65] of char;
+    i : word;
+begin
+   if key_len > 64 then
+     begin
+       MD5SHA_old(key,key_len,key,0,md5_sha);
+       if md5_sha = 0 then key_len := 16
+       else key_len := 20;
+     end;
+   Mem_Set(@ipad, 0x36, 64);
+   Mem_Set(@opad, 0x5c, 64);
+   i := 0;
+   while i < key_len do
+     begin
+       ipad[i] := ipad[i] xor key^;
+       opad[i] := opad[i] xor key^;
+       inc(i);
+       inc(key);
+      end;
+   MD5SHA_old(@ipad,65,@ipad,0,md5_sha);      // we use one dummy byte at the end of ipad
+   MD5SHA_old(text,text_len,hmac,1,md5_sha);
+   MD5SHA_old(@opad,65,@opad,0,md5_sha);      // we use one dummy byte at the end of opad
+   if md5_sha = 0 then i := 16
+   else i := 20;
+   MD5SHA_old(hmac,i,hmac,1,md5_sha);
+end;
+
+procedure AES_128_CBC_encrypt(key16,iv16,text : ^char; text_len : word);
+var blocks,i,buf : word;
+begin
+  if (text_len mod 16) = 0 then nop else exit;
+
+  blocks := text_len div 16;
+
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for AES engine to be free...
+
+  buf := Eth_ReadReg(ECON2_);
+  buf.0 := 0;           // AESLEN 128-bit key
+  buf.1 := 0;           // AESLEN 128-bit key
+  Eth_WriteReg(ECON2_, buf);
+
+  dma_write(0x7C00, key16, 16);
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.11 := 1;           // AESST
+  Eth_WriteReg(ECON1_, buf);
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for key to be loaded
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.9 := 1;           // AESOP CBC encrypt
+  buf.10 := 0;           // AESOP CBC encrypt
+  Eth_WriteReg(ECON1_, buf);
+
+  dma_write(0x7C20, iv16, 16);
+
+  i := 0;
+  while i < blocks do
+    begin
+      // write the next block ...
+      dma_write(0x7C30, text + i*16, 16);
+      buf := Eth_ReadReg(ECON1_);
+      buf.11 := 1;           // AESST start encryption
+      Eth_WriteReg(ECON1_, buf);
+      while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for completion
+      dma_read(0x7C20, text + i*16, 16);
+      inc(i);
+  end;
+end;
+
+procedure AES_128_CBC_decrypt(key16,iv16,text : ^char; text_len : word);
+var blocks,i,buf : word;
+begin
+  if (text_len mod 16) = 0 then nop else exit;
+
+  blocks := text_len div 16;
+
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for AES engine to be free...
+
+  buf := Eth_ReadReg(ECON2_);
+  buf.0 := 0;           // AESLEN 128-bit key
+  buf.1 := 0;           // AESLEN 128-bit key
+  Eth_WriteReg(ECON2_, buf);
+
+  dma_write(0x7C00, key16, 16);
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.11 := 1;           // AESST
+  Eth_WriteReg(ECON1_, buf);
+  while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for key to be loaded
+
+  buf := Eth_ReadReg(ECON1_);
+  buf.9 := 0;           // AESOP CBC decrypt
+  buf.10 := 1;          // AESOP CBC decrypt
+  Eth_WriteReg(ECON1_, buf);
+
+  dma_write(0x7C30, iv16, 16);
+
+  i := 0;
+  while i < blocks do
+    begin
+      // write the next block ...
+      dma_write(0x7C20, text + i*16, 16);
+      buf := Eth_ReadReg(ECON1_);
+      buf.11 := 1;           // AESST start decryption
+      Eth_WriteReg(ECON1_, buf);
+      while (Eth_ReadReg(ECON1_) and $0800) <> 0 do delayms(1); // AESST wait for completion
+      dma_read(0x7C40, text + i*16, 16);
+      CopyEthMemToEthMem(0x7C40,0x7C30,16);
+      inc(i);
+    end;
+end;
+
+procedure modexp(var y : array[128] of byte;
+                 var e : array[128] of byte; e_len : word;
+                 var x : array[128] of byte; x_len : word;
+                 var m : array[128] of byte; m_len : word);
+var buf : array[128] of byte;
+    buf1 : word;
+begin
+  // Only 512, 768, and 1024 bit moduli are supported
+  if (m_len <> 64) and (m_len <> 96) and (m_len <> 128) then exit;
+
+  // e and x must be strictly less than m
+  if (e_len > m_len) or (x_len > e_len) then exit;
+
+{ datasheet 15.1
+      "For the Modular Exponentiation engine to work correctly, the
+      Most Significant (MSb) bit of M must be set."
+}
+
+  if (m[0] and 0x80) = 0 then exit;
+
+  // left-pad e, x with zeros
+  Mem_Set(@buf, 0, m_len);
+  Mem_Cpy(@buf + m_len - e_len, @e, e_len);
+  dma_write(0x7800, @buf, m_len);
+
+  Mem_Set(@buf, 0, m_len);
+  Mem_Cpy(@buf + m_len - x_len, @x, x_len);
+  dma_write(0x7880, @buf, m_len);
+
+  dma_write(0x7900, @m, m_len);
+
+  buf1 := Eth_ReadReg(ECON2_);
+  buf1.2 := 0;                              // MODLEN 64
+  buf1.3 := 0;                              // MODLEN 64
+  if m_len = 96 then buf1.2 := 1            // MODLEN 96
+  else if m_len = 128 then buf1.3 := 1;     // MODLEN 128
+  Eth_WriteReg(ECON2_, buf1);
+
+  buf1 := Eth_ReadReg(ECON1_);
+  buf1.15 := 1;           // MODEXST enable modexp engine
+  Eth_WriteReg(ECON1_, buf1);
+  while (Eth_ReadReg(ECON1_) and $8000) <> 0 do delayms(1);
+
+  dma_read(0x7880, @y, m_len);
+end;
+
+procedure out_broadcast_local(port,len : word; var d_in : array[4096] of char);
+var broadcast_ip : array[4] of byte;
+var i,j : word;
+    buf : string[1300];
+begin
+  broadcast_ip[0] := 255;
+  broadcast_ip[1] := 255;
+  broadcast_ip[2] := 255;
+  broadcast_ip[3] := 255;
+
+  j := 0;
+  while len <> 0 do
+    begin
+      i := len;
+      if i > 1280 then i := 1280;
+
+      Mem_Cpy(@buf,@d_in[j],i);
+
+      Send_UDP_Broadcast(broadcast_ip,port,port,i,buf);
+      Do_EthernetProc;
+
+      j := j + i;
+      len := len - i;
+    end;
+end;
+
+procedure SSL_Init;
+begin
+  HTTP_send_Port_ssl := TMR1 + 23456;
+  certificate_len := 0;
+  host_response_len_ssl := 0;
+end;
+
+procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
+var max_len : word;
+label next_;
+begin
+  Socket[j].Keep_Alive := true;
+
+  if host_response_len_ssl >= 4096 then exit;
+
+  if host_response_len_ssl <> 0 then    // one packet arrived
+    begin
+      max_len := 4096 - host_response_len_ssl;
+      if len_ > max_len then len_ := max_len;
+    end;
+
+  CopyEthMem_CPToRam(@host_response[host_response_len_ssl], len_);
+  host_response_len_ssl := host_response_len_ssl + len_;
+end;
+
+function OpenTCPConnection_SSL(port : word) : boolean;
+var i : word;
+label end_end_,again_;
+begin
+  i := 0;
+
+again_:
+
+  Wait_With_Eth(100);
+
+  result := false;
+
+  if Str_Len(server_address_url) < 3 then exit;
+
+  if IsIP(server_address_url) <> 0 then
+    begin
+      Str2IP(server_address_url,server_addr);
+    end
+  else
+  if Dns_Resolve(server_address_url,server_addr) = false then
+  if Dns_Resolve(server_address_url,server_addr) = false then
+    begin
+      if UDP_debug <> 0 then
+        begin
+          Socket_TCP_buf := 'DNS fail';
+          out_broadcast_local(33335,Str_Len(Socket_TCP_buf),Socket_TCP_buf);
+        end;
+      goto end_end_;
+    end;
+
+  o_sock_ssl := 11;
+
+  Close_TCP_Connection_Advance(o_sock_ssl);   // we use tcp socket 11
+
+  TCP_Close_Port(HTTP_send_Port_ssl);
+
+  HTTP_send_Port_ssl := HTTP_send_Port_ssl + 1;
+
+  if HTTP_send_Port_ssl > 65000 then HTTP_send_Port_ssl := TMR1 + 23456;
+
+  TCP_Open_Port(HTTP_send_Port_ssl);
+
+  if Open_TCP_Connection_Advance(server_addr,port,HTTP_send_Port_ssl,o_sock_ssl) <> 0 then
+    begin
+      result := true;
+      exit;
+    end;
+
+end_end_:
+  if i < 2 then
+    begin
+      inc(i);
+      goto again_; // try one more time
+    end;
+end;
+
+function SendTCP_SSL(len : word) : boolean;
+begin
+
+  Wait_With_Eth(100);
+
+  result := false;
+
+  if Socket[o_sock_ssl].State_S <> 2 then exit;
+
+      if UDP_debug <> 0 then
+        begin
+          out_broadcast_local(33335,len,HTTP_data_out);
+        end;
+
+      Socket[o_sock_ssl].RAM_ROM := 0;
+      Socket[o_sock_ssl].Keep_Alive := true;
+      Socket[o_sock_ssl].Exp_Time_Val := 100;
+      Socket[o_sock_ssl].Do_Not_Fragment := 1;
+      Socket[o_sock_ssl].Start_addr := @HTTP_data_out;
+      Socket[o_sock_ssl].Stop_addr := Socket[o_sock_ssl].Start_addr + len;
+
+      CC0_TCP := 0;
+      while Socket[o_sock_ssl].State_S = 2 do      // while connected
+        begin
+          if CC0_TCP > 49 then break; // fail in 4 sec
+          if Socket[o_sock_ssl].Start_addr = Socket[o_sock_ssl].Stop_addr then
+            begin
+              result := true;
+              exit;
+            end;
+          Do_EthernetProc;
+          Process_DHCP;
+        end;
+end;
+
+function SendTCPwait_SSL(len : word) : boolean;
+begin
+
+  Wait_With_Eth(100);
+
+  result := false;
+
+  if Socket[o_sock_ssl].State_S <> 2 then exit;
+
+      if UDP_debug <> 0 then
+        begin
+          out_broadcast_local(33335, len, HTTP_data_out);
+        end;
+      
+      // detect the SSL state:
+      //   if client hello, then reset calculating MD5 hash
+      //       and load the engine with start data
+      //   if server hello then continue calculating MD5 by
+      //       adding server response to hash data
+      
+      
+      Socket[o_sock_ssl].RAM_ROM := 0;
+      Socket[o_sock_ssl].Keep_Alive := true;
+      Socket[o_sock_ssl].Exp_Time_Val := 100;
+      Socket[o_sock_ssl].Do_Not_Fragment := 1;
+      Socket[o_sock_ssl].Start_addr := @HTTP_data_out;
+      Socket[o_sock_ssl].Stop_addr := Socket[o_sock_ssl].Start_addr + len;
+
+      host_response_len_ssl := 0;
+
+      CC0_TCP := 0;
+      while Socket[o_sock_ssl].State_S = 2 do      // while connected
+        begin
+          if CC0_TCP > 49 then break; // fail in 4 sec
+          if host_response_len_ssl <> 0 then
+            begin
+              result := true;
+              break;
+            end;
+          Do_EthernetProc;
+          Process_DHCP;
+        end;
+end;
+
+function CreateClientHello: word; // returns number of bytes
+begin
+      // build a "Client Hello" message
+      Mem_Set(@HTTP_data_out, 0, 256);
+
+      // 1. TLS record header
+      HTTP_data_out[0]  := $16;     // content type = handhsake
+      HTTP_data_out[1]  := $03;     // protocol version
+      HTTP_data_out[2]  := $02;     // protocol version, TLS 1.1
+
+      HTTP_data_out[3]  := $00;     // content length HiByte
+      HTTP_data_out[4]  := $2f;     // content length LoByte => 47B in total after this point
+
+      // 2. Handshake header, hashing starts here
+      HTTP_data_out[5]  := $01;     // handshake type code = 1 => clienthello
+      HTTP_data_out[6]  := $00;     // length
+      HTTP_data_out[7]  := $00;     // length
+      HTTP_data_out[8]  := $2b;     // length = 43 bytes from this point onwards
+
+      // 3. client hello starts here
+      HTTP_data_out[9]  := $03;      // protocol version
+      HTTP_data_out[10] := $02;      // protocol version, TLS 1.1
+
+      Random_Array_32(@HTTP_data_out[11]); // from 11 to 42, inclusive
+
+      HTTP_data_out[43] := $00;     // session id byte length, 0 bytes for client hello (no session yet)
+
+      HTTP_data_out[44] := $00;     // ciphersuite list length, hiByte
+      HTTP_data_out[45] := $04;     // ciphersuite list length, loByte = 4 integers, i.e. 8 bytes
+
+      HTTP_data_out[46] := $00;     // ciphersuite list
+      HTTP_data_out[47] := $2f;     // ciphersuite list, single ciphersuite TLS_RSA_WITH_AES_128_CBC_SHA
+
+      HTTP_data_out[48] := $00;     // no regotiation supported
+      HTTP_data_out[49] := $ff;     // no regotiation supported
+
+      HTTP_data_out[50] := $01;     // compression list
+      HTTP_data_out[51] := $00;     // compression list, 'null' (no-op) compression
+      
+      result := 52;
+end;
+
+//** error codes:
+//  0 - no error
+//  1 - unknown error
+//  2 - server hello expected
+//  3 - server certificate expected
+//  4 - server hello done expected
+function Open_SSL(port : word) : boolean;
+var clientHelloLength: word;
+    serverResponseLength: word;
+    locali: word;
+    serverRandom: array[32] of byte;
+    startIndex, stopIndex: word;
+    certificateLength: dword;
+    helloDoneLength: word;
+    sessionIDLength: byte;
+    sessionID: array[32] of byte; // careful here, the length can be longer
+    serverCertificateLength: dword;
+    serverCertificateStartIndex: word;
+    ptr: ^byte;
+begin
+  result := 1;
+  certificate_len := 0;
+  if OpenTCPConnection_SSL(port) <> 0 then
+    begin
+      toHashMD5.firstBlock := TRUE; // start a new hash
+      toHashMD5.dataLength := 0;
+      clientHelloLength := CreateClientHello();
+      if SendTCPwait_SSL(clientHelloLength) <> 0 then
+        begin
+          // we need to hash everything in client hello, except TLS headers, index from 5 to 51
+          for locali := 5 to 51 do
+            begin
+              AddToHash(HTTP_data_out[locali], 1);
+            end;
+        
+          Wait_With_Eth(500);
+          if UDP_debug <> 0 then
+            begin
+              out_broadcast_local(33335, host_response_len_ssl, host_response);
+            end;
+          
+          // **  server response consists of three parts:
+          //    1. Server hello
+          //    2. Server certificate
+          //    3. Server hello done
+          
+          // 1. Server hello
+            begin
+              locali := 0;
+              sessionIDLength := 0;
+              serverCertificateLength := 0;
+              certificateLength := 0;
+              Mem_Set(@ServerRandom, 0, 32);
+
+              if       (host_response[0] = 0x16) // this is a TLS response
+                   and (host_response[1] = 0x03) // TLS 1.1
+                   and (host_response[2] = 0x02) // TLS 1.1
+                   and (host_response[5] = 0x02) // server hello
+                 then begin
+                   result := 2; // server hello expected
+                   Hi(serverResponseLength) := host_response[3];
+                   Lo(serverResponseLength) := host_response[4];
+                   startIndex := 5; // exclude headers in hashing
+                   stopIndex  := startIndex + serverResponseLength - 1;
+                   for locali := startIndex to stopIndex do
+                     begin
+                       // hash the entire message, without headers
+                       AddToHash(host_response[locali], 1);
+                       
+                       // extract server random
+                       if (locali >= 11) and (locali <= 42) then // server Random
+                         begin
+                           ServerRandom[locali - 11] := host_response[locali];
+                         end;
+
+                       // extract session id
+                       if locali = 43 then
+                         sessionIDLength := host_response[locali];
+                         
+                       if     (locali >= 44)
+                          and (locali <= 44 + sessionIDLength - 1)
+                          and (sessionIDLength <= 32)  then
+                         begin
+                           sessionID[locali - 44] := host_response[locali];
+                         end;
+                         
+                       // extract ciphercuite value
+                       //  todo: takes 10 bytes and compare with what we asked the server for
+                       
+                       // server certificate starts
+                       if locali = 44 + 10 + sessionIDLength then
+                         begin
+                             serverCertificateStartIndex := locali;
+                         end;
+                     end;
+                   
+                   result := 0;
+                 end;
+            end;
+          
+          
+          // 2. Server certificate
+          if result = 0 then // proceed
+            begin
+              result := 3; // server certificate expected
+              
+              ServerCertificate.PublicKey.Key.Exponent[0] := 0;
+              ServerCertificate.PublicKey.Key.Exponent[1] := 0;
+              ServerCertificate.PublicKey.Key.Exponent[2] := 0;
+              ServerCertificate.PublicKey.Key.Exponent[3] := 0;
+              ServerCertificate.PublicKey.Key.BaseLength := 0;
+              ServerCertificate.PublicKey.Key.ExponentLength := 0;
+              for locali := 0 to 511 do
+                ServerCertificate.PublicKey.Key.Base[locali] := 0;
+
+              locali := serverCertificateStartIndex;
+              
+              if (host_response[locali] = 0x0b) then // server certificate
+                begin
+                  Higher(serverCertificateLength) := host_response[locali + 1];
+                  Hi(serverCertificateLength) := host_response[locali + 2];
+                  Lo(serverCertificateLength) := host_response[locali + 3];
+
+                  // extract certificates
+                  startIndex := locali + 10; // there are 10 bytes before the cert starts
+                  stopIndex  := startIndex + serverCertificateLength - 1;
+                  X509Init(host_response, serverCertificateLength);
+                  while startIndex < serverCertificateLength do
+                    begin
+                      DecodeCertificate(host_response, ServerCertificate, startIndex);
+                      if ServerCertificate.PublicKey.Key.BaseLength > 0 then // we have the key
+                        if ServerCertificate.PublicKey.Key.ExponentLength > 0 then // we have the key
+                          break;
+                    end;
+                  result := 0;
+                end;
+            end;
+            
+         // 3. Server hello done
+          if result = 0 then // proceed
+            begin
+              result := 4; // server hello done expected
+              locali := stopIndex + 1;
+              //the last four bytes should be 0E 00 00 00
+
+              if      (host_response[host_response_len_ssl - 4] = 0x0e) // server hello done
+                  and (host_response[host_response_len_ssl - 3] = 0x00)
+                  and (host_response[host_response_len_ssl - 2] = 0x00)
+                  and (host_response[host_response_len_ssl - 1] = 0x00)
+                then begin
+                  startIndex := locali;
+                  stopIndex  := host_response_len_ssl - 1;
+                  for locali := startIndex to stopIndex do
+                     begin
+                       // hash the entire message, without headers
+                       AddToHash(host_response[locali], 1);
+                     end;
+                  result := 0;
+                end;
+            end;
+            
+          Mem_Cpy(@certificate_output,@host_response,host_response_len_ssl);
+          certificate_len := host_response_len_ssl;
+        end;
+
+    end;
+end;
+
+end.
