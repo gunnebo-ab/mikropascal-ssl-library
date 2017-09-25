@@ -6,7 +6,7 @@ uses dspic_additional_string_library,lib_Delays_LIO,def_io,lib1_enc600_V3_5_b,
 
 procedure Random_Init;
 procedure Random_Array_32(d_in : ^byte);
-//procedure MD5SHA_old(d_in : ^char; len : word; d_out : ^byte; hashop,md5_sha : byte);
+procedure Random_Array_46(d_in : ^byte);
 procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
                    , restoreContextID // 0 - none
                                       // 1 - SHA 1
@@ -16,7 +16,7 @@ procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
                                       // 2 - MD5
                    : byte);
 procedure MD5SHAFinal(dataIn, dataOut : ^char; dataLength : word; shaMd5, contextID: byte);
-procedure HMAC_MD5SHA(key : ^char; key_len : word; text : ^char; text_len : word; hmac : ^char; md5_sha : byte);
+procedure HMAC_MD5SHA(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte; textLength : word; var hmacResult :array[20] of byte; shaMd5 : byte);
 procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
 procedure AES_128_CBC_decrypt(key16, iv16, text : ^char; text_len : word);
 procedure modexp(var y : array[128] of byte;
@@ -49,8 +49,9 @@ var m_z,m_w,m_r : dword;
 var MD5_buff, SHA1_buff : array[28] of byte;
 var toHashMD5, toHashSHA1: TtoHash;
 var ServerCertificate: TX509Certificate;
-
-
+var MD5Hash: array[16] of char;
+var SHA1Hash: array[20] of char;
+var MasterSecret: array[46] of byte;
 
 procedure Random_Init;
 begin
@@ -92,6 +93,30 @@ begin
     end;
 end;
 
+procedure Random_Array_46(d_in : ^byte);
+var i : byte;
+begin
+  i := 0;
+  while i < 11 do
+    begin
+      AnalyzeRandom;
+      d_in^ := Lo(m_r);
+      inc(d_in);
+      d_in^ := Hi(m_r);
+      inc(d_in);
+      d_in^ := Higher(m_r);
+      inc(d_in);
+      d_in^ := Highest(m_r);
+      inc(d_in);
+      inc(i);
+    end;
+  // two more bytes to make it 46
+  AnalyzeRandom;
+  d_in^ := Lo(m_r);
+  inc(d_in);
+  d_in^ := Hi(m_r);
+end;
+
 procedure dma_write(addr : word; d_in : ^char; len : word);
 begin
   CopyRamToEthMem(d_in, $680, len);
@@ -104,13 +129,9 @@ begin
   CopyEthMemToRam($680,d_out,len);
 end;
 
-
-
-procedure MD5SHA_Final(d_in : ^char; len : word; d_out : ^byte; hashop, md5_sha : byte);
-begin
-end;
-
-procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
+procedure MD5SHA(  dataIn : ^char;
+                   dataLength : word; 
+                   shaMd5             // 0 - SHA1, 1 - MD5
                    , restoreContextID // 0 - none
                                       // 1 - SHA 1
                                       // 2 - MD5
@@ -124,11 +145,13 @@ begin
   buf := Eth_ReadReg(ECON2_);
   if shaMd5 = 1 then
     begin
+      UART3_Write_Text('.MD5SHA-M D 5.');
       buf.SHA1MD5 := 0;           // MD5
       shaMd5 := 16;
     end
   else
     begin
+      UART3_Write_Text('.MD5SHA-S H A 1.');
       buf.SHA1MD5 := 1;           // SHA1
       shaMd5 := 20;
     end;
@@ -136,13 +159,15 @@ begin
   
   buf := Eth_ReadReg(ECON1_);
 
-  if restoreContextID = 1 then
+  if restoreContextID = 2 then
     begin
+      UART3_Write_Text('.MD5SHA-m.');
       dma_write(0x7A40, @MD5_buff, 28);
       buf.HASHOP := 1; // continue prev hash
     end
-  else if restoreContextID = 2 then
+  else if restoreContextID = 1 then
     begin
+      UART3_Write_Text('.MD5SHA-s.');
       dma_write(0x7A40, @SHA1_buff, 28);
       buf.HASHOP := 1; // continue prev hash
     end
@@ -170,13 +195,18 @@ begin
           i := i + 64;
         end;
 
-      if saveContextID = 1 then
-        dma_read(0x7A70, @MD5_buff, 28)
-      else if saveContextID = 2 then
-        dma_read(0x7A70, @SHA1_buff, 28);
+      if saveContextID = 2 then
+        begin
+          UART3_Write_Text('.MD5SHA-mm.');
+          dma_read(0x7A70, @MD5_buff, 28);
+        end
+      else if saveContextID = 1 then
+        begin
+          UART3_Write_Text('.MD5SHA-ss.');
+          dma_read(0x7A70, @SHA1_buff, 28);
+        end;
     end;
 
-    
   buf := Eth_ReadReg(ECON1_);
   buf.HASHEN := 0;           // HASHEN
   Eth_WriteReg(ECON1_, buf);
@@ -193,13 +223,15 @@ begin
   Eth_WriteReg(ECON2_, buf);
   
   buf := Eth_ReadReg(ECON1_);
-  if restoreContextID = 1 then
+  if restoreContextID = 2 then
     begin
+      UART3_Write_Text('.final-md5.');
       dma_write(0x7A40, @MD5_buff, 28);
       buf.HASHOP := 1; // continue prev hash
     end
-  else if restoreContextID = 2 then
+  else if restoreContextID = 1 then
     begin
+      UART3_Write_Text('.final-sha1.');
       dma_write(0x7A40, @SHA1_buff, 28);
       buf.HASHOP := 1; // continue prev hash
     end
@@ -236,18 +268,43 @@ end;
 //******************************************************************************
 procedure AddToHash(hashByte: byte; ShaMD5: byte);
 var save, restore: byte;
+    tmp: array[64] of byte;
+    i: byte;
 begin
   if ShaMD5 = 0 then
     begin
+      UART3_Write_Text('.SHA1.');
+      toHashSHA1.hashed := false; // new data is pending
       toHashSHA1.dataIn[toHashSHA1.dataLength] := hashByte;
       toHashSHA1.dataLength := toHashSHA1.dataLength + 1;
       if (toHashSHA1.dataLength >= 64) then
         begin // hash the current block
-
+          save := 1; // always save the context
+          if toHashSHA1.firstBlock <> 0 then
+            begin // we do not restore on the first block
+              restore := 0;
+            end
+          else
+            begin
+              restore := 1;
+            end;
+          for i := 0 to 63 do
+            tmp[i] := toHashSHA1.dataIn[i];
+          MD5SHA(@tmp, // data to be hashed
+                 65,                    // 64B actually, but the extra one will trigger a proper procedure
+                 0,                     // SHA1
+                 restore,               // context
+                 save                   // context
+                 );
+          toHashSHA1.dataLength := 0;   // prepare for next block
+          toHashSHA1.hashed := true;    // not really needed?
+          toHashSHA1.firstBlock := false;
         end;
     end
   else
     begin
+      UART3_Write_Text('.MD5.');
+      toHashMD5.hashed := false; // new data is pending
       toHashMD5.dataIn[toHashMD5.dataLength] := hashByte;
       toHashMD5.dataLength := toHashMD5.dataLength + 1;
       if (toHashMD5.dataLength >= 64) then
@@ -261,115 +318,89 @@ begin
             begin
               restore := 2;
             end;
-          MD5SHA(@toHashMD5.dataIn[0], // data to be hashed
+          for i := 0 to 63 do
+            tmp[i] := toHashMD5.dataIn[i];
+          MD5SHA(@tmp, // data to be hashed
                  65,                   // 64B actually, but the extra one will trigger a proper procedure
-                 save,                 // context
+                 1,                    // MD5
                  restore,              // context
-                 1                  ); // MD5
+                 save);                // context
+
           toHashMD5.dataLength := 0;   // prepare for next block
           toHashMD5.hashed := true;    // not really needed?
+          toHashMD5.firstBlock := false;
         end;
     end;
 end;
 
-procedure MD5SHA_old(d_in : ^char; len : word; d_out : ^byte; hashop, md5_sha : byte);
-var i : word;
-    buf : word;
-    ptr: ^byte;
-begin
-  ptr^ := @d_out;
-  buf := Eth_ReadReg(ECON2_);
-  if md5_sha = 0 then
-    begin
-      buf.12 := 0;           // MD5
-      md5_sha := 16;
-    end
-  else
-    begin
-      buf.12 := 1;           // SHA1
-      md5_sha := 20;
-    end;
-  Eth_WriteReg(ECON2_, buf);
-  buf := Eth_ReadReg(ECON1_);
-
-  if hashop <> 0 then // continue prev hash
-    begin
-      dma_write(0x7A40, @MD5_buff, 28);
-      buf.13 := 1;           // HASHOP;
-    end
-  else // begin a new hash
-    begin
-      buf.13 := 0;           // HASHOP
-    end;
-
-  buf.14 := 1;           // HASHEN
-  i := 0;
-  if len >= 64 then
-    begin
-      buf.12 := 0;           // HASHLST
-
-      Eth_WriteReg(ECON1_, buf);
-      while len > 64 do
-        begin
-          //UART3_Write_Text('Here 1.');
-          buf := Eth_ReadReg(EIR_);
-          buf.13 := 0;           // HASHIF
-          Eth_WriteReg(EIR_, buf);
-          dma_write(0x7A00, d_in + i, 64);
-          while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
-          len := len - 64;
-          i := i + 64;
-        end;
-      dma_read(0x7A70, @MD5_buff, 28);
-    end
-  else
-    begin
-      buf.12 := 1;           // HASHLST
-      Eth_WriteReg(ECON1_, buf);
-    end;
- 
-  if len > 0 then
-    begin
-     // UART3_Write_Text('Here 2.');
-      ptr^ := ptr^ + i;
-      dma_write(0x7A00, d_in + i, len);
-      while (Eth_ReadReg(EIR_) and $2000) = 0 do delayms(1); // HASHIF
-    end;
-  dma_read(0x7A70, d_out, md5_sha);
-  buf := Eth_ReadReg(ECON1_);
-  buf.14 := 0;           // HASHEN
-  Eth_WriteReg(ECON1_, buf);
-end;
-
-procedure HMAC_MD5SHA(key : ^char; key_len : word; text : ^char; text_len : word; hmac : ^char; md5_sha : byte);
-var ipad,opad : array[65] of char;
+procedure HMAC_MD5SHA(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte; textLength : word; var hmacResult :array[20] of byte; shaMd5 : byte);
+const BLOCK_SIZE = 64;
+var ipad, opad : array[65] of char;
     i : word;
+    isha: array [20] of byte;
+    buf: array[BLOCK_SIZE] of byte;
+    digestSize: byte;
+    secretKeyHash: array[64] of byte;
+    saveContext, restoreContext: byte;
+    tmp: array[64] of byte;
 begin
-   if key_len > 64 then
+  if shaMd5 = 0 then
+    begin
+      digestSize := 20;
+      restoreContext := 1;
+      saveContext := 1;
+    end
+  else
+    begin
+      digestSize := 16;
+      restoreContext := 2;
+      saveContext := 2;
+    end;
+    
+  if secretKeyLength > BLOCK_SIZE then
+    begin
+        MD5SHA(secretKey, secretKeyLength, shaMd5, 0, saveContext);
+        i := secretKeyLength div 64;
+        i := i * 64;                     // completed bytes
+        secretKeyLength := secretKeyLength mod 64; // remaining bytes
+
+        MD5SHAFinal(secretKey + i, @secretKeyHash, secretKeyLength, shaMd5, restoreContext);
+    end
+  else
+    begin
+      for i := 0 to secretKeyLength - 1 do
+        begin
+          secretKeyHash[i] := secretKey^;
+          inc(secretKey);
+        end;
+    end;
+
+  //**** Inner Digest ****/
+  Mem_Set(@ipad, 0x36, 64);
+  Mem_Set(@opad, 0x5c, 64);
+   
+  for i := 0 to secretKeyLength - 1 do
      begin
-       MD5SHA_old(key,key_len,key,0,md5_sha);
-       if md5_sha = 0 then key_len := 16
-       else key_len := 20;
+       ipad[i] := ipad[i] xor secretKeyHash[i];
+       opad[i] := opad[i] xor secretKeyHash[i];
      end;
-   Mem_Set(@ipad, 0x36, 64);
-   Mem_Set(@opad, 0x5c, 64);
-   i := 0;
-   while i < key_len do
+  i := 0;
+  MD5SHA(@ipad, 65, shaMd5, 0, saveContext);
+  if textLength > 64 then
      begin
-       ipad[i] := ipad[i] xor key^;
-       opad[i] := opad[i] xor key^;
-       inc(i);
-       inc(key);
-      end;
-   MD5SHA_old(@ipad,65,@ipad,0,md5_sha);      // we use one dummy byte at the end of ipad
-   MD5SHA_old(text,text_len,hmac,1,md5_sha);
-   MD5SHA_old(@opad,65,@opad,0,md5_sha);      // we use one dummy byte at the end of opad
-   if md5_sha = 0 then i := 16
-   else i := 20;
-   MD5SHA_old(hmac,i,hmac,1,md5_sha);
+        MD5SHA(textToHash, textLength, shaMd5, restoreContext, saveContext);
+        i := textLength div 64;
+        i := i * 64;                     // completed bytes
+        textLength := textLength mod 64; // remaining bytes
+     end;
+  MD5SHAFinal(textToHash + i, @isha, textLength, shaMd5, restoreContext);
+
+  //**** Outter Digest ****
+  MD5SHA(@opad, 65, shaMd5, 0, restoreContext);
+  MD5SHAFinal(@isha, @hmacResult, digestSize, shaMd5, restoreContext);
 end;
 
-procedure AES_128_CBC_encrypt(key16,iv16,text : ^char; text_len : word);
+procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
 var blocks,i,buf : word;
 begin
   if (text_len mod 16) = 0 then nop else exit;
@@ -562,7 +593,7 @@ again_:
   Wait_With_Eth(100);
 
   result := false;
-
+  UART3_Write_Text('here -1');
   if Str_Len(server_address_url) < 3 then exit;
 
   if IsIP(server_address_url) <> 0 then
@@ -570,17 +601,37 @@ again_:
       Str2IP(server_address_url,server_addr);
     end
   else
-  if Dns_Resolve(server_address_url,server_addr) = false then
-  if Dns_Resolve(server_address_url,server_addr) = false then
     begin
-      if UDP_debug <> 0 then
+      UART3_Write_Text('here 0');
+      if Dns_Resolve(server_address_url,server_addr) = false then
         begin
-          Socket_TCP_buf := 'DNS fail';
-          out_broadcast_local(33335,Str_Len(Socket_TCP_buf),Socket_TCP_buf);
+          UART3_Write_Text('here 1');
+          if Dns_Resolve(server_address_url,server_addr) = false then
+            begin
+              //if UDP_debug <> 0 then
+                begin
+                  Socket_TCP_buf := 'DNS fail';
+                  out_broadcast_local(33335,Str_Len(Socket_TCP_buf),Socket_TCP_buf);
+                end;
+              goto end_end_;
+            end
+          else
+            begin
+            //  if UDP_debug <> 0 then
+                begin
+                  Socket_TCP_buf := 'DNS resolved';
+                  out_broadcast_local(33335, Str_Len(Socket_TCP_buf), Socket_TCP_buf);
+                end;
+            end;
+        end
+      else
+        begin
+          Socket_TCP_buf := 'DNS resolved';
+          out_broadcast_local(33335, Str_Len(Socket_TCP_buf),Socket_TCP_buf);
+          Mem_Cpy(@Socket_TCP_buf, @server_addr, 4);
+          out_broadcast_local(33335, 4, Socket_TCP_buf);
         end;
-      goto end_end_;
     end;
-
   o_sock_ssl := 11;
 
   Close_TCP_Connection_Advance(o_sock_ssl);   // we use tcp socket 11
@@ -655,14 +706,7 @@ begin
         begin
           out_broadcast_local(33335, len, HTTP_data_out);
         end;
-      
-      // detect the SSL state:
-      //   if client hello, then reset calculating MD5 hash
-      //       and load the engine with start data
-      //   if server hello then continue calculating MD5 by
-      //       adding server response to hash data
-      
-      
+
       Socket[o_sock_ssl].RAM_ROM := 0;
       Socket[o_sock_ssl].Keep_Alive := true;
       Socket[o_sock_ssl].Exp_Time_Val := 100;
@@ -684,6 +728,72 @@ begin
           Do_EthernetProc;
           Process_DHCP;
         end;
+end;
+
+
+function CreateClientKeyExchange: word; // returns number of bytes
+var PreMasterSecret, rsaCipherText: array[128] of byte; // 1024 bits
+    i: byte;
+begin
+      // build a "Client Key Exchange" message
+      Mem_Set(@HTTP_data_out, 0, 256);
+
+      // 1. TLS record header
+      HTTP_data_out[0]  := $16;     // content type = handhsake
+      HTTP_data_out[1]  := $03;     // protocol version
+      HTTP_data_out[2]  := $02;     // protocol version, TLS 1.1
+
+      HTTP_data_out[3]  := $00;     // Record length Hi
+      HTTP_data_out[4]  := $82;     // Record length Lo - total 132 bytes after this byte
+
+      HTTP_data_out[5]  := $10;     // ClientKeyExchange message type
+      
+      HTTP_data_out[6]  := $00;     // Message length Higher
+      HTTP_data_out[7]  := $00;     // Message length Hi
+      HTTP_data_out[8]  := $80;     // Message length Lo - 128 bytes
+      
+      //form the 1024 bit integer (128 bytes) as 00 01 <PS> 00 03 02 <RND>
+      PreMasterSecret[0]  := $00;
+      PreMasterSecret[1]  := $01;
+
+      // form PS, 77 bytes in length
+      Random_Array_32(@PreMasterSecret[2]); // from 2 to 33, inclusive
+      Random_Array_46(@PreMasterSecret[34]); // from 34 to 79, inclusive
+      
+      // note: PS now contains 78 bytes, we have to overwrite the last byte to make it 77
+      PreMasterSecret[79] := 00;
+      PreMasterSecret[80] := 03;
+      PreMasterSecret[81] := 02;
+      
+      // RND, 46 bytes in length, this is master secret
+      Random_Array_46(@MasterSecret); // from 82 to 127, inclusive
+      // copy the master secret to pre master secret array
+      for i := 0 to 45 do
+        begin
+          PreMasterSecret[82 + i] := MasterSecret[i];
+        end;
+
+      // RSA encrypt PreMaster Secret
+//      procedure modexp(var y : array[128] of byte;
+//                 var e : array[128] of byte; e_len : word;
+//                 var x : array[128] of byte; x_len : word;
+//                 var m : array[128] of byte; m_len : word);
+      
+      modexp(@rsaCipherText,
+             ServerCertificate.PublicKey.Key.Exponent,
+             ServerCertificate.PublicKey.Key.ExponentLength,
+             @PreMasterSecret,
+             128,   // PreMasterSecret length
+             ServerCertificate.PublicKey.Key.Base,
+             ServerCertificate.PublicKey.Key.BaseLength
+             );
+       // copy rsaCipherText to HTTP_data_out
+       for i := 0 to 127 do
+         begin
+           HTTP_data_out[9 + i] := rsaCipherText[i];
+         end;
+      
+      result := 137;
 end;
 
 function CreateClientHello: word; // returns number of bytes
@@ -728,12 +838,148 @@ begin
       result := 52;
 end;
 
+function CreateChangeCipher: word; // returns number of bytes
+begin
+      // build a "Change Cipher" message
+      Mem_Set(@HTTP_data_out, 0, 256);
+
+      // 1. TLS record header
+      HTTP_data_out[0]  := $14;     // content type = change cipher
+      HTTP_data_out[1]  := $03;     // protocol version
+      HTTP_data_out[2]  := $02;     // protocol version, TLS 1.1
+
+      HTTP_data_out[3]  := $00;     // Message length Hi
+      HTTP_data_out[4]  := $01;     // Record length Lo - 1 byte only
+
+      HTTP_data_out[5]  := $01;     // ChangeCipherSpec
+      result := 6;
+end;
+
+function CreateClientFinished(): word; // returns number of bytes
+var labelAndSeed: array[51] of byte; //"client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
+    ALabelAndSeed: array[71] of byte; //HMAC_MD5/SHA1 (16/20 bytes) + labelAndSeed (51 bytes)
+    seed: array[36] of byte;
+    i: byte;
+    s1, s2: array[23] of byte;
+    P_MD5: array[16] of byte;
+    P_SHA1: array[20] of byte;
+    aMD5, hMD5: array[16] of byte;
+    aSHA1, hSHA1: array[20] of byte;
+    prf: array[12] of byte;
+begin
+      // prepare data
+      labelAndSeed := 'client finished';
+      //note: do not forget to overwrite the trailing zero
+      
+      // copy MD5
+      for i := 0 to 15 do
+        begin
+          labelAndSeed[i + 15] := MD5Hash[i];
+          seed[i] := MD5Hash[i];
+        end;
+
+      // copy SHA-1
+      for i := 0 to 19 do
+        begin
+          labelAndSeed[i + 15 + 16] := SHA1Hash[i];
+          seed[i + 16] := SHA1Hash[i];
+        end;
+      
+      for i := 0 to 22 do
+        begin
+          s1[i] := MasterSecret[i];
+        end;
+        
+      for i := 23 to 45 do
+        begin
+          s2[i - 23] := MasterSecret[i];
+        end;
+        
+ //********************* MD5
+      // calculate A
+      HMAC_MD5SHA(@s1, // secret key
+                  23,  // secretKeyLength 
+                  @labelAndSeed,
+                  51,  // label and seed length
+                  aMD5,
+                  1); // MD5
+      // store A
+      for i := 0 to 15 do
+        begin
+          ALabelAndSeed[i] := aMD5[i];
+        end;
+      // append label + seed
+      for i := 0 to 50 do
+        begin
+          ALabelAndSeed[i + 16] := labelAndSeed[i];
+        end;
+      // calculate h
+      HMAC_MD5SHA(@s1, // secret key
+                  23,  // secretKeyLength
+                  @ALabelAndSeed,// A (16 bytes) + "client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
+                  67,  // A + label + seed length
+                  hMD5,
+                  1); // MD5
+ 
+ //********************* SHA1
+      // calculate A
+      HMAC_MD5SHA(@s2, // secret key
+                  23,  // secretKeyLength
+                  @labelAndSeed,
+                  51,  // label and seed length
+                  aSHA1,
+                  0); // SHA1
+      // store A
+      for i := 0 to 19 do
+        begin
+          ALabelAndSeed[i] := aSHA1[i];
+        end;
+      // append label + seed
+      for i := 0 to 50 do
+        begin
+          ALabelAndSeed[i + 20] := labelAndSeed[i];
+        end;
+      // calculate h
+      HMAC_MD5SHA(@s2, // secret key
+                  23,  // secretKeyLength
+                  @ALabelAndSeed,// A (20 bytes) + "client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
+                  71,  // A + label + seed length
+                  hSHA1,
+                  0); // SHA1
+
+     //the first 12 bytes of h from P_MD5 and P_SHA are xored together
+     for i := 0 to 11 do
+       begin
+         prf[i] := hMD5[i] xor hSHA1[i];
+       end;
+
+      // build a "client finished" message
+      Mem_Set(@HTTP_data_out, 0, 256);
+
+      // 1. TLS record header
+      HTTP_data_out[0]  := $16;     // content type = handshake
+      HTTP_data_out[1]  := $03;     // protocol version
+      HTTP_data_out[2]  := $02;     // protocol version, TLS 1.1
+
+      HTTP_data_out[3]  := $00;     // Message length Hi
+      HTTP_data_out[4]  := $40;     // Record length Lo - 64 bytes
+
+      // todo: add TLS handshake header 13 00 00 0C
+      // todo: calculate HMAC
+      // todo: random IV
+      
+      // todo
+      result := 53;
+end;
+
 //** error codes:
 //  0 - no error
 //  1 - unknown error
 //  2 - server hello expected
 //  3 - server certificate expected
 //  4 - server hello done expected
+//  5 - Client Key Exchange not sent
+//  6 - Client Finish not sent
 function Open_SSL(port : word) : boolean;
 var clientHelloLength: word;
     serverResponseLength: word;
@@ -747,6 +993,9 @@ var clientHelloLength: word;
     serverCertificateLength: dword;
     serverCertificateStartIndex: word;
     ptr: ^byte;
+    clientKeyExchangeLength : byte;
+    clientChangeCipherLength : byte;
+    clientFinishedLength: word;
 begin
   result := 1;
   certificate_len := 0;
@@ -754,13 +1003,18 @@ begin
     begin
       toHashMD5.firstBlock := TRUE; // start a new hash
       toHashMD5.dataLength := 0;
+      
+      toHashSHA1.firstBlock := TRUE; // start a new hash
+      toHashSHA1.dataLength := 0;
+      
       clientHelloLength := CreateClientHello();
       if SendTCPwait_SSL(clientHelloLength) <> 0 then
         begin
           // we need to hash everything in client hello, except TLS headers, index from 5 to 51
           for locali := 5 to 51 do
             begin
-              AddToHash(HTTP_data_out[locali], 1);
+              AddToHash(HTTP_data_out[locali], 0); // SHA - 1
+              AddToHash(HTTP_data_out[locali], 1); // MD5
             end;
         
           Wait_With_Eth(500);
@@ -795,7 +1049,8 @@ begin
                    for locali := startIndex to stopIndex do
                      begin
                        // hash the entire message, without headers
-                       AddToHash(host_response[locali], 1);
+                       AddToHash(host_response[locali], 0); // SHA-1
+                       AddToHash(host_response[locali], 1); // MD5
                        
                        // extract server random
                        if (locali >= 11) and (locali <= 42) then // server Random
@@ -883,15 +1138,51 @@ begin
                   for locali := startIndex to stopIndex do
                      begin
                        // hash the entire message, without headers
-                       AddToHash(host_response[locali], 1);
+                       AddToHash(host_response[locali], 0); // SHA-1
+                       AddToHash(host_response[locali], 1); // MD5
                      end;
                   result := 0;
                 end;
             end;
             
           Mem_Cpy(@certificate_output,@host_response,host_response_len_ssl);
-          certificate_len := host_response_len_ssl;
+          certificate_len := host_response_len_ssl;  
+          // finish hashing
+          MD5SHAFinal( @toHashMD5.dataIn,  @MD5Hash,  toHashMD5.dataLength,  1, 0);
+          MD5SHAFinal( @toHashSHA1.dataIn, @SHA1Hash, toHashSHA1.dataLength, 1, 1);
+          
+          // prepare Client Key Exchange message
+          clientKeyExchangeLength := CreateClientKeyExchange();
+          if SendTCP_SSL(clientKeyExchangeLength) <> 0 then // we expect no response from the server
+            begin
+              Wait_With_Eth(500);
+              //if UDP_debug <> 0 then
+                begin
+                  out_broadcast_local(33335, host_response_len_ssl, host_response);
+                end;
+
+              clientChangeCipherLength := CreateChangeCipher();
+              if SendTCP_SSL(clientChangeCipherLength) <> 0 then // we expect no response from the server
+                begin
+                  Wait_With_Eth(500);
+                  //if UDP_debug <> 0 then
+                    begin
+                      out_broadcast_local(33335, host_response_len_ssl, host_response);
+                    end;
+                    
+                  clientFinishedLength := CreateClientFinished();
+                end
+              else
+                begin
+                  result := 6; // client ChangeCipher not sent
+                end;
+            end
+          else
+            begin
+              result := 5; // clientkey exchange not sent
+            end;
         end;
+
 
     end;
 end;
