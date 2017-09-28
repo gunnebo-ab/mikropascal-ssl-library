@@ -29,6 +29,10 @@ function OpenTCPConnection_SSL(port : word) : boolean;
 function SendTCP_SSL(len : word) : boolean;
 function SendTCPwait_SSL(len : word) : boolean;
 function Open_SSL(port : word) : boolean;
+procedure PRF(secretKey: ^byte; secretKeyLength: word;
+              aLabel: ^byte; labelLength: word;
+              seed: ^byte; seedLength: word;
+              prfOut: ^byte; prfLength: word);
 
 const HASHLST = 12;   // ECON1
       HASHOP  = 13;   // ECON1
@@ -72,6 +76,27 @@ procedure AnalyzeRandom;
 begin
   m_r := Random;
   while ((Lo(m_r) = 0) or (Hi(m_r) = 0) or (Higher(m_r) = 0) or (Highest(m_r) = 0)) do m_r := Random;
+end;
+
+// number of bytes must be divisible by 4
+procedure Random_Array(randomData : ^byte; numberOfBytes: byte);
+var i : word;
+begin
+  numberOfBytes := numberOfBytes div 4;
+  i := 0;
+  while i < numberOfBytes do
+    begin
+      AnalyzeRandom;
+      randomData^ := Lo(m_r);
+      inc(randomData);
+      randomData^ := Hi(m_r);
+      inc(randomData);
+      randomData^ := Higher(m_r);
+      inc(randomData);
+      randomData^ := Highest(m_r);
+      inc(randomData);
+      inc(i);
+    end;
 end;
 
 procedure Random_Array_32(d_in : ^byte);
@@ -335,14 +360,13 @@ end;
 
 procedure HMAC_MD5SHA(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte; textLength : word; var hmacResult :array[20] of byte; shaMd5 : byte);
 const BLOCK_SIZE = 64;
-var ipad, opad : array[65] of char;
+var ipad, opad : array[BLOCK_SIZE + 1] of char;
     i : word;
     isha: array [20] of byte;
     buf: array[BLOCK_SIZE] of byte;
     digestSize: byte;
-    secretKeyHash: array[64] of byte;
+    secretKeyHash: array[BLOCK_SIZE] of byte;
     saveContext, restoreContext: byte;
-    tmp: array[64] of byte;
 begin
   if shaMd5 = 0 then
     begin
@@ -360,9 +384,9 @@ begin
   if secretKeyLength > BLOCK_SIZE then
     begin
         MD5SHA(secretKey, secretKeyLength, shaMd5, 0, saveContext);
-        i := secretKeyLength div 64;
-        i := i * 64;                     // completed bytes
-        secretKeyLength := secretKeyLength mod 64; // remaining bytes
+        i := secretKeyLength div BLOCK_SIZE;
+        i := i * BLOCK_SIZE;                     // completed bytes
+        secretKeyLength := secretKeyLength mod BLOCK_SIZE; // remaining bytes
 
         MD5SHAFinal(secretKey + i, @secretKeyHash, secretKeyLength, shaMd5, restoreContext);
     end
@@ -376,27 +400,28 @@ begin
     end;
 
   //**** Inner Digest ****/
-  Mem_Set(@ipad, 0x36, 64);
-  Mem_Set(@opad, 0x5c, 64);
+  Mem_Set(@ipad, 0x36, BLOCK_SIZE);
+  Mem_Set(@opad, 0x5c, BLOCK_SIZE);
    
   for i := 0 to secretKeyLength - 1 do
      begin
        ipad[i] := ipad[i] xor secretKeyHash[i];
        opad[i] := opad[i] xor secretKeyHash[i];
      end;
+  
   i := 0;
-  MD5SHA(@ipad, 65, shaMd5, 0, saveContext);
-  if textLength > 64 then
+  MD5SHA(@ipad, BLOCK_SIZE + 1, shaMd5, 0, saveContext);
+  if textLength > BLOCK_SIZE then
      begin
         MD5SHA(textToHash, textLength, shaMd5, restoreContext, saveContext);
-        i := textLength div 64;
-        i := i * 64;                     // completed bytes
-        textLength := textLength mod 64; // remaining bytes
+        i := textLength div BLOCK_SIZE;
+        i := i * BLOCK_SIZE;                     // completed bytes
+        textLength := textLength mod BLOCK_SIZE; // remaining bytes
      end;
   MD5SHAFinal(textToHash + i, @isha, textLength, shaMd5, restoreContext);
 
   //**** Outter Digest ****
-  MD5SHA(@opad, 65, shaMd5, 0, restoreContext);
+  MD5SHA(@opad, BLOCK_SIZE + 1, shaMd5, 0, restoreContext);
   MD5SHAFinal(@isha, @hmacResult, digestSize, shaMd5, restoreContext);
 end;
 
@@ -856,16 +881,13 @@ begin
 end;
 
 function CreateClientFinished(): word; // returns number of bytes
-var labelAndSeed: array[51] of byte; //"client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
-    ALabelAndSeed: array[71] of byte; //HMAC_MD5/SHA1 (16/20 bytes) + labelAndSeed (51 bytes)
-    seed: array[36] of byte;
+var labelAndSeed: array[51] of byte;   //"client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
+    ALabelAndSeed: array[71] of byte;  //HMAC_MD5/SHA1 (16/20 bytes) + labelAndSeed (51 bytes)
     i: byte;
     s1, s2: array[23] of byte;
-    P_MD5: array[16] of byte;
-    P_SHA1: array[20] of byte;
     aMD5, hMD5: array[16] of byte;
     aSHA1, hSHA1: array[20] of byte;
-    prf: array[12] of byte;
+    prfOut: array[12] of byte;
 begin
       // prepare data
       labelAndSeed := 'client finished';
@@ -875,14 +897,12 @@ begin
       for i := 0 to 15 do
         begin
           labelAndSeed[i + 15] := MD5Hash[i];
-          seed[i] := MD5Hash[i];
         end;
 
       // copy SHA-1
       for i := 0 to 19 do
         begin
           labelAndSeed[i + 15 + 16] := SHA1Hash[i];
-          seed[i + 16] := SHA1Hash[i];
         end;
       
       for i := 0 to 22 do
@@ -950,7 +970,7 @@ begin
      //the first 12 bytes of h from P_MD5 and P_SHA are xored together
      for i := 0 to 11 do
        begin
-         prf[i] := hMD5[i] xor hSHA1[i];
+         prfOut[i] := hMD5[i] xor hSHA1[i];
        end;
 
       // build a "client finished" message
@@ -964,9 +984,32 @@ begin
       HTTP_data_out[3]  := $00;     // Message length Hi
       HTTP_data_out[4]  := $40;     // Record length Lo - 64 bytes
 
-      // todo: add TLS handshake header 13 00 00 0C
-      // todo: calculate HMAC
-      // todo: random IV
+      // random IV, 16 bytes, indexed from 5 to 20 inclusive
+      Random_Array(@HTTP_data_out[5], 16);
+
+      // add AD, sequence number and header for content type, 00 00 00 00 00 00 00 00 16 03 02 00 10
+      for i := 20 to 27 do
+        HTTP_data_out[i] := 0x00;
+      HTTP_data_out[28] := 0x16;  // handshake ContentType
+      HTTP_data_out[29] := 0x03;  // version
+      HTTP_data_out[30] := 0x02;  // version TLS 1.1
+      HTTP_data_out[31] := 0x00;  // length hi
+      HTTP_data_out[32] := 0x10;  // length lo (16 bytes of hmac follows)
+
+      // add TLS handshake header 14 00 00 0C
+      HTTP_data_out[33] := 0x14;
+      HTTP_data_out[34] := 0x00;
+      HTTP_data_out[35] := 0x00;
+      HTTP_data_out[36] := 0x0C;
+
+      // append prf, indexed from 36 to 47 inclusive
+      for i := 0 to 11 do
+        begin
+           HTTP_data_out[36 + i] := prfOut[i];
+        end;
+
+      // calculate HMAC, from index  20 to 47
+
       
       // todo
       result := 53;
@@ -1184,6 +1227,72 @@ begin
         end;
 
 
+    end;
+end;
+
+// labelLength must be even and does not include a trailing zero, if any
+// secretKeyLength must be even
+procedure PRF(secretKey: ^byte; secretKeyLength: word;
+              aLabel: ^byte; labelLength: word;
+              seed: ^byte; seedLength: word;
+              prfOut: ^byte; prfLength: word);
+var s1, s2: array[64] of byte;
+    i, L_S: byte;
+    aMD5, hMD5: array[16] of char;
+    aSHA1, hSHA1: array[20] of char;
+    labelAndSeed1: array[64] of byte;
+    labelAndSeed2: array[84] of byte;
+    p: ^byte;
+begin
+  L_S := secretKeyLength div 2; // secretKeyLength must be even
+  for i := 0 to L_S - 1 do
+    begin
+      s1[i] := secretKey^;
+      inc(secretKey);
+    end;
+  for i := L_S to secretKeyLength - 1 do
+    begin
+      s2[i - L_S] := secretKey^;
+      inc(secretKey);
+    end;
+  for i := 0 to labelLength - 1 do
+    begin
+      labelAndSeed1[i + 16] := aLabel^;
+      labelAndSeed2[i + 20] := aLabel^;
+      inc(aLabel);
+    end;
+  for i := 0 to seedLength - 1 do
+    begin
+      labelAndSeed1[labelLength + i + 16] := seed^;
+      labelAndSeed2[labelLength + i + 20] := seed^;
+      inc(seed);
+    end;
+  //A0
+  p := @labelAndSeed1;
+  p := p + 16;
+  HMAC_MD5SHA(@s1, L_S, p, labelLength + seedLength,  aMD5, 1);
+  //A1
+  for i := 0 to 15 do
+    begin
+      labelAndSeed1[i] := aMD5[i];
+    end;
+  p := @labelAndSeed1;
+  HMAC_MD5SHA(@s1, L_S, p, labelLength + seedLength + 16,  hMD5, 1);
+
+  p := @labelAndSeed2;
+  p := p + 20;
+  HMAC_MD5SHA(@s2, L_S, p, labelLength + seedLength, aSHA1, 0);
+  for i := 0 to 19 do
+    begin
+      labelAndSeed2[i] := aSHA1[i];
+    end;
+  
+  p := @labelAndSeed2;
+  HMAC_MD5SHA(@s2, L_S, p, labelLength + seedLength + 20,  hSHA1, 0);
+  for i := 0 to prfLength - 1 do
+    begin
+      prfOut^ := hMD5[i] xor hSHA1[i];
+      inc(prfOut);
     end;
 end;
 
