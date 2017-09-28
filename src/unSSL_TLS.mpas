@@ -881,97 +881,35 @@ begin
 end;
 
 function CreateClientFinished(): word; // returns number of bytes
-var labelAndSeed: array[51] of byte;   //"client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
-    ALabelAndSeed: array[71] of byte;  //HMAC_MD5/SHA1 (16/20 bytes) + labelAndSeed (51 bytes)
+var seed: array[36] of byte;   //md5 (16 bytes) + sha-1 (20 bytes)
     i: byte;
-    s1, s2: array[23] of byte;
-    aMD5, hMD5: array[16] of byte;
-    aSHA1, hSHA1: array[20] of byte;
-    prfOut: array[12] of byte;
+    verify_data: array[12] of byte;
+    aLabel: string[15];
 begin
-      // prepare data
-      labelAndSeed := 'client finished';
-      //note: do not forget to overwrite the trailing zero
-      
+   // prepare data
+      aLabel := 'client finished';
       // copy MD5
       for i := 0 to 15 do
         begin
-          labelAndSeed[i + 15] := MD5Hash[i];
+          seed[i + 15] := MD5Hash[i];
         end;
-
       // copy SHA-1
       for i := 0 to 19 do
         begin
-          labelAndSeed[i + 15 + 16] := SHA1Hash[i];
+          seed[i + 15 + 16] := SHA1Hash[i];
         end;
-      
-      for i := 0 to 22 do
-        begin
-          s1[i] := MasterSecret[i];
-        end;
-        
-      for i := 23 to 45 do
-        begin
-          s2[i - 23] := MasterSecret[i];
-        end;
-        
- //********************* MD5
-      // calculate A
-      HMAC_MD5SHA(@s1, // secret key
-                  23,  // secretKeyLength 
-                  @labelAndSeed,
-                  51,  // label and seed length
-                  aMD5,
-                  1); // MD5
-      // store A
-      for i := 0 to 15 do
-        begin
-          ALabelAndSeed[i] := aMD5[i];
-        end;
-      // append label + seed
-      for i := 0 to 50 do
-        begin
-          ALabelAndSeed[i + 16] := labelAndSeed[i];
-        end;
-      // calculate h
-      HMAC_MD5SHA(@s1, // secret key
-                  23,  // secretKeyLength
-                  @ALabelAndSeed,// A (16 bytes) + "client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
-                  67,  // A + label + seed length
-                  hMD5,
-                  1); // MD5
- 
- //********************* SHA1
-      // calculate A
-      HMAC_MD5SHA(@s2, // secret key
-                  23,  // secretKeyLength
-                  @labelAndSeed,
-                  51,  // label and seed length
-                  aSHA1,
-                  0); // SHA1
-      // store A
-      for i := 0 to 19 do
-        begin
-          ALabelAndSeed[i] := aSHA1[i];
-        end;
-      // append label + seed
-      for i := 0 to 50 do
-        begin
-          ALabelAndSeed[i + 20] := labelAndSeed[i];
-        end;
-      // calculate h
-      HMAC_MD5SHA(@s2, // secret key
-                  23,  // secretKeyLength
-                  @ALabelAndSeed,// A (20 bytes) + "client finished" (15 bytes) + md5 (16 bytes) + sha-1 (20 bytes)
-                  71,  // A + label + seed length
-                  hSHA1,
-                  0); // SHA1
-
-     //the first 12 bytes of h from P_MD5 and P_SHA are xored together
-     for i := 0 to 11 do
-       begin
-         prfOut[i] := hMD5[i] xor hSHA1[i];
-       end;
+    //secretKey: ^byte; secretKeyLength: word;
+    //          aLabel: ^byte; labelLength: word;
+    //          seed: ^byte; seedLength: word;
+    //          prfOut: ^byte; prfLength: word);
+     Prf(@MasterSecret,
+         48,             // Master Secret Length
+         @aLabel,        // label
+         15,             // label length
+         @seed,          // seed
+         36,             // seed length
+         @verify_data,   // verify_data
+         12);            // verify_data length
 
       // build a "client finished" message
       Mem_Set(@HTTP_data_out, 0, 256);
@@ -1005,7 +943,7 @@ begin
       // append prf, indexed from 36 to 47 inclusive
       for i := 0 to 11 do
         begin
-           HTTP_data_out[36 + i] := prfOut[i];
+           HTTP_data_out[36 + i] := verify_data[i];
         end;
 
       // calculate HMAC, from index  20 to 47
