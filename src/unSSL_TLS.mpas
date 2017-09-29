@@ -33,8 +33,16 @@ procedure PRF(secretKey: ^byte; secretKeyLength: word;
               aLabel: ^byte; labelLength: word;
               seed: ^byte; seedLength: word;
               prfOut: ^byte; prfLength: word);
+              
+procedure AddToHash(hashByte: byte; ShaMD5: byte);
 
-
+type TtoHash = record
+  hashed: boolean;           // indicates if dataIn is hashed
+  firstBlock: boolean;       // if set, then hash engine is reset
+  dataLength: byte;          // current length of dataIn
+  dataIn: array[65] of byte; // data to be hashed, 65 because we will always transfer one byte to the next iteration
+end;
+ var toHashMD5, toHashSHA1: TtoHash; // todo: should be local
 
 implementation
 
@@ -55,12 +63,7 @@ const TLS_HELLO_REQUEST       =  0x00; //  0
       TLS_CLIENT_KEY_EXCHANGE =  0x10; // 16
       TLS_FINISHED            =  0x14; // 20
       
-type TtoHash = record
-  hashed: boolean;           // indicates if dataIn is hashed
-  firstBlock: boolean;       // if set, then hash engine is reset
-  dataLength: byte;          // current length of dataIn
-  dataIn: array[64] of byte; // data to be hashed
-end;
+
 
 type TPreMasterSecret = record
   clientVersion: array[2] of byte;
@@ -69,15 +72,18 @@ end;
 
 var m_z,m_w,m_r : dword;
 var MD5_buff, SHA1_buff : array[28] of byte;
-var toHashMD5, toHashSHA1: TtoHash;
+
 var ServerCertificate: TX509Certificate;
 var MD5Hash: array[16] of char;
 var SHA1Hash: array[20] of char;
 var masterSecret: array[48] of byte;
 var preMasterSecret: TPreMasterSecret;
 
-var serverRandom: array[32] of byte;
+var serverRandom: array[32] of char; // todo: restore to byte
 var clientRandom: array[32] of byte;
+
+var serverCipherSuite: array[2] of byte;
+var serverCompressionMethod: byte;
 
 procedure Random_Init;
 begin
@@ -324,7 +330,7 @@ begin
       toHashSHA1.hashed := false; // new data is pending
       toHashSHA1.dataIn[toHashSHA1.dataLength] := hashByte;
       toHashSHA1.dataLength := toHashSHA1.dataLength + 1;
-      if (toHashSHA1.dataLength >= 64) then
+      if (toHashSHA1.dataLength > 64) then  // do it only if another byte is pending after this block(because of the call to final)
         begin // hash the current block
           save := 1; // always save the context
           if toHashSHA1.firstBlock <> 0 then
@@ -343,7 +349,8 @@ begin
                  restore,               // context
                  save                   // context
                  );
-          toHashSHA1.dataLength := 0;   // prepare for next block
+          toHashSHA1.dataLength := 1; // one byte remained, move it to next iteration
+          toHashSHA1.dataIn[0] := toHashSHA1.dataIn[64]; // this is the orphan that was not hashed
           toHashSHA1.hashed := true;    // not really needed?
           toHashSHA1.firstBlock := false;
         end;
@@ -354,7 +361,7 @@ begin
       toHashMD5.hashed := false; // new data is pending
       toHashMD5.dataIn[toHashMD5.dataLength] := hashByte;
       toHashMD5.dataLength := toHashMD5.dataLength + 1;
-      if (toHashMD5.dataLength >= 64) then
+      if (toHashMD5.dataLength > 64) then // do it only if another byte is pending after this block (because of the call to final)
         begin // hash the current block
           save := 2; // always save the context
           if toHashMD5.firstBlock <> 0 then
@@ -373,7 +380,9 @@ begin
                  restore,              // context
                  save);                // context
 
-          toHashMD5.dataLength := 0;   // prepare for next block
+          toHashMD5.dataLength := 1; // one byte remained, move it to next iteration
+          toHashMD5.dataIn[0] := toHashMD5.dataIn[64]; // this is the orphan that was not hashed
+                                                       // move it to the next block
           toHashMD5.hashed := true;    // not really needed?
           toHashMD5.firstBlock := false;
         end;
@@ -709,7 +718,6 @@ function SendTCP_SSL(len : word) : boolean;
 begin
 
   Wait_With_Eth(100);
-
   result := false;
 
   if Socket[o_sock_ssl].State_S <> 2 then exit;
@@ -761,7 +769,8 @@ begin
       Socket[o_sock_ssl].Start_addr := @HTTP_data_out;
       Socket[o_sock_ssl].Stop_addr := Socket[o_sock_ssl].Start_addr + len;
 
-      host_response_len_ssl := 0;
+      host_response := '';
+      host_response_len := 0;
 
       CC0_TCP := 0;
       while Socket[o_sock_ssl].State_S = 2 do      // while connected
@@ -789,7 +798,7 @@ begin
       preMasterSecret.clientVersion[1] := 0x02;
       
       // encrypt the premaster secret
-      //  1. extend the pre master secret to 1024 bit integer by adding Random
+      //  1. extend the pre master secret to 1024 bit (128 bytes) integer by adding Random
       //  2. use HTTP_data_out as a temporary storage
       //  3. form the 1024 bit integer (128 bytes) as 00 01 <PS> 00 <Pre Master Secret>
       Mem_Set(@HTTP_data_out, 0, 256);
@@ -800,11 +809,10 @@ begin
       Random_Array_46(@HTTP_data_out[34]); // from 34 to 79, inclusive
       // note: this makes it 78 bytes in total, therefore we will trim the last byte
       
-      HTTP_data_out[79] := preMasterSecret.clientVersion[0]; // version hi
-      HTTP_data_out[80] := preMasterSecret.clientVersion[1]; // version lo
-      HTTP_data_out[81] := 0x00;
-
-      // append pre master secret
+      HTTP_data_out[79] := 0x00;
+      HTTP_data_out[80] := preMasterSecret.clientVersion[0]; // version hi
+      HTTP_data_out[81] := preMasterSecret.clientVersion[1]; // version lo
+      // append pre master secret random
       for i := 0 to 45 do
         begin
            HTTP_data_out[82 + i] := preMasterSecret.random[i];
@@ -861,7 +869,7 @@ begin
       HTTP_data_out[4]  := $2f;     // content length LoByte => 47B in total after this point
 
       // 2. Handshake header, hashing starts here
-      HTTP_data_out[5]  := $01;     // handshake type code = 1 => clienthello
+      HTTP_data_out[5]  := TLS_CLIENT_HELLO;     // handshake type code = 1 => clienthello
       HTTP_data_out[6]  := $00;     // length
       HTTP_data_out[7]  := $00;     // length
       HTTP_data_out[8]  := $2b;     // length = 43 bytes from this point onwards
@@ -971,7 +979,7 @@ begin
      
       // compute verify data
       CalculateVerifyData(verifyData);
-
+//      UART3_Write(0x55);
       // build a "client finished" message
       Mem_Set(@HTTP_data_out, 0, 256);
       
@@ -981,7 +989,7 @@ begin
       HTTP_data_out[2]  := $02;     // protocol version, TLS 1.1
 
       HTTP_data_out[3]  := $00;     // Message length Hi
-      HTTP_data_out[4]  := $10;     // Record length Lo - 16 bytes
+      HTTP_data_out[4]  := $10;     // Record  length Lo - 16 bytes
       
       // add TLS handshake header 14 00 00 0C
       HTTP_data_out[5] := 0x14;
@@ -1050,21 +1058,22 @@ end;
 //  6 - Client ChangeCipher not sent
 //  7 - Client Finished not sent
 function Open_SSL(port : word) : boolean;
-var //clientHelloLength: word;
+var
     serverResponseLength: word;
     locali: word;
     startIndex, stopIndex: word;
     certificateLength: dword;
     helloDoneLength: word;
     sessionIDLength: byte;
+    // todo: session id goes to record parameters
     sessionID: array[32] of byte; // careful here, the length can be longer
+    extensionsLength: word;
+
     serverCertificateLength: dword;
     serverCertificateStartIndex: word;
     ptr: ^byte;
-    {clientKeyExchangeLength : byte;
-    clientChangeCipherLength : byte;
-    clientFinishedLength: word;}
     messageLength: word;
+    debugMsg: string[32];
 begin
   result := 1;
   certificate_len := 0;
@@ -1117,6 +1126,7 @@ begin
                    stopIndex  := startIndex + serverResponseLength - 1;
                    for locali := startIndex to stopIndex do
                      begin
+                       ClrWDT();
                        // hash the entire message, without headers
                        AddToHash(host_response[locali], 0); // SHA-1
                        AddToHash(host_response[locali], 1); // MD5
@@ -1125,8 +1135,15 @@ begin
                        if (locali >= 11) and (locali <= 42) then // server Random
                          begin
                            ServerRandom[locali - 11] := host_response[locali];
+                           
+                           if locali = 42 then
+                             begin
+                               debugMsg := 'Server Random';
+                               out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
+                               out_broadcast_local(33335, 32, serverRandom);
+                             end;
                          end;
-
+  
                        // extract session id
                        if locali = 43 then
                          sessionIDLength := host_response[locali];
@@ -1139,10 +1156,21 @@ begin
                          end;
                          
                        // extract ciphercuite value
-                       //  todo: takes 10 bytes and compare with what we asked the server for
+                        // take two bytes of server's ciphesuite value
+                       if (locali =  44 + sessionIDLength) then
+                         serverCipherSuite[0] := host_response[locali];
+                       if (locali =  44 + sessionIDLength + 1) then
+                         serverCipherSuite[1] := host_response[locali];
+                       
+                       // server compression method
+                       if (locali =  44 + sessionIDLength + 2) then
+                          serverCompressionMethod := host_response[locali];
+                          
+                       // 7 bytes follow up, <length:2><extensions:5>
+                       // todo: skiping server extensions
                        
                        // server certificate starts
-                       if locali = 44 + 10 + sessionIDLength then
+                       if locali = 44 + 7 + sessionIDLength then
                          begin
                              serverCertificateStartIndex := locali;
                          end;
@@ -1162,21 +1190,21 @@ begin
               ServerCertificate.PublicKey.Key.Exponent[1] := 0;
               ServerCertificate.PublicKey.Key.Exponent[2] := 0;
               ServerCertificate.PublicKey.Key.Exponent[3] := 0;
-              ServerCertificate.PublicKey.Key.BaseLength := 0;
+              ServerCertificate.PublicKey.Key.BaseLength  := 0;
               ServerCertificate.PublicKey.Key.ExponentLength := 0;
               for locali := 0 to 511 do
                 ServerCertificate.PublicKey.Key.Base[locali] := 0;
 
               locali := serverCertificateStartIndex;
               
-              if (host_response[locali] = 0x0b) then // server certificate
+              if (host_response[locali] = TLS_CERTIFICATE) then // server certificate 0x0b
                 begin
                   Higher(serverCertificateLength) := host_response[locali + 1];
                   Hi(serverCertificateLength) := host_response[locali + 2];
                   Lo(serverCertificateLength) := host_response[locali + 3];
 
                   // extract certificates
-                  startIndex := locali + 10; // there are 10 bytes before the cert starts
+                  startIndex := locali;
                   stopIndex  := startIndex + serverCertificateLength - 1;
                   X509Init(host_response, serverCertificateLength);
                   while startIndex < serverCertificateLength do
@@ -1217,7 +1245,7 @@ begin
           Mem_Cpy(@certificate_output,@host_response,host_response_len_ssl);
           certificate_len := host_response_len_ssl;  
           // finish hashing
-          MD5SHAFinal( @toHashMD5.dataIn,  @MD5Hash,  toHashMD5.dataLength,  1, 0);
+          MD5SHAFinal( @toHashMD5.dataIn,  @MD5Hash,  toHashMD5.dataLength,  0, 2);
           MD5SHAFinal( @toHashSHA1.dataIn, @SHA1Hash, toHashSHA1.dataLength, 1, 1);
           
           // prepare Client Key Exchange message
@@ -1230,17 +1258,20 @@ begin
                   out_broadcast_local(33335, host_response_len_ssl, host_response);
                 end;
 
+              host_response_len_ssl := 0;
               messageLength := CreateChangeCipher();
               if SendTCP_SSL(messageLength) <> 0 then // we expect no response from the server
                 begin
                   Wait_With_Eth(500);
                   //if UDP_debug <> 0 then
                     begin
-                      out_broadcast_local(33335, host_response_len_ssl, host_response);
+                      debugMsg := 'Change Cipher Sent';
+                      out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
+
                     end;
                     
                   messageLength := CreateClientFinished();
-                  if SendTCP_SSL(messageLength) <> 0 then // we expect no response from the server
+                  if SendTCPwait_SSL(messageLength) <> 0 then
                     begin
                       Wait_With_Eth(500);
                       //if UDP_debug <> 0 then
@@ -1251,6 +1282,7 @@ begin
                   else
                     begin
                       result := 7; // client Finished not sent
+                      out_broadcast_local(33335, host_response_len_ssl, host_response);
                     end;
                 end
               else
