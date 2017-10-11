@@ -16,7 +16,8 @@ procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
                                       // 2 - MD5
                    : byte);
 procedure MD5SHAFinal(dataIn, dataOut : ^char; dataLength : word; shaMd5, contextID: byte);
-procedure HMAC_MD5SHA(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte; textLength : word; var hmacResult :array[20] of byte; shaMd5 : byte);
+procedure HMAC_ShaMd5(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte;
+                      textLength : word; hmacResult : ^byte; shaMd5 : byte);
 procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
 procedure AES_128_CBC_decrypt(key16, iv16, text : ^char; text_len : word);
 function  modexp(var y : array[128] of byte;
@@ -41,10 +42,11 @@ type TtoHash = record
   dataIn: array[65] of byte; // data to be hashed, 65 because we will always transfer one byte to the next iteration
 end;
 
+var toHashMD5, toHashSHA1: TtoHash;
 
 implementation
 
-var toHashMD5, toHashSHA1: TtoHash;
+
 
 const HASHLST = 12;   // ECON1
       HASHOP  = 13;   // ECON1
@@ -284,9 +286,15 @@ var buf : word;
 begin
   buf := Eth_ReadReg(ECON2_);
   if shaMD5 = 1 then // MD5
-    shaMD5 := 16
-  else
-    shaMD5 := 20;
+    begin
+      shaMD5 := 16;
+      buf.SHA1MD5 := 0;
+    end
+  else // SHA1
+    begin
+      shaMD5 := 20;
+      buf.SHA1MD5 := 1;
+    end;
   Eth_WriteReg(ECON2_, buf);
   
   buf := Eth_ReadReg(ECON1_);
@@ -399,7 +407,8 @@ begin
     end;
 end;
 
-procedure HMAC_MD5SHA(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte; textLength : word; var hmacResult :array[20] of byte; shaMd5 : byte);
+procedure HMAC_ShaMd5(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte;
+                      textLength : word; hmacResult : ^byte; shaMd5 : byte);
 const BLOCK_SIZE = 64;
 var ipad, opad : array[BLOCK_SIZE + 1] of char;
     i : word;
@@ -463,7 +472,7 @@ begin
 
   //**** Outter Digest ****
   MD5SHA(@opad, BLOCK_SIZE + 1, shaMd5, 0, restoreContext);
-  MD5SHAFinal(@isha, @hmacResult, digestSize, shaMd5, restoreContext);
+  MD5SHAFinal(@isha, hmacResult, digestSize, shaMd5, restoreContext);
 end;
 
 procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
@@ -979,7 +988,7 @@ begin
       
       if UDP_debug then
         begin
-          msg := 'preMasterSecret';
+          msg := 'preMasterSecret random';
           out_broadcast_local(33335, Str_Len(msg), msg);
           out_broadcast_local(33335,
                               46,
@@ -1139,14 +1148,14 @@ begin
 
   for i := 0 to 31 do
     seed[i + 32] := serverRandom[i];
-
+  //uart3_write_text(' PRF MS ');
   PRF(@preMasterSecret,
-      46,               // pre master key length
+      48,               // pre master key length
       @aLabel,          // label
       13,               // label length
       @seed,            // ClientHello.random + ServerHello.random
       64,               // seed length
-      @masterSecretOut, // out masterSecret
+      @masterSecret, // @masterSecretOut, // out masterSecret
       48);              // masterSecret length
 end;
 
@@ -1165,14 +1174,15 @@ begin
   for i := 0 to 31 do
     seed[i+32] := clientRandom[i];
 
-  PRF(@masterSecretIn,  // note: master secret here
+  uart3_write_text(' PRF ke ');
+  PRF(@masterSecret, //In,  // note: master secret here
       48,               // master secret length
       @aLabel,          // label
       13,               // label length
       @seed,            // ServerHello.random + ClientHello.random
       64,               // seed length
       @keys,            // out keys
-      128);             // masterSecret length , 20 + 20 + 16 + 16 + 16 + 16 = 104
+      104);             // PRF length , 20 + 20 + 16 + 16 + 16 + 16 = 104
       
   for i := 0 to 19 do
     client_write_MAC_secret[i] := keys[i];
@@ -1205,6 +1215,7 @@ begin
           seed[i + 16] := SHA1Hash[i];
         end;
 
+     uart3_write_text(' PRF CF ');
      // compute verify data
      Prf(@MasterSecret,
          48,             // Master Secret Length
@@ -1213,7 +1224,7 @@ begin
          @seed,          // seed
          36,             // seed length
          @verifyDataOut, // verify_data
-         12);            // verify_data length
+         12);            // verify_data length, must be at least 16, but we will take only 12
 end;
 
 function CreateClientFinished(): word; // returns number of bytes
@@ -1274,7 +1285,7 @@ begin
         end;
         
       // calculate HMAC SHA-1 of the message
-      HMAC_MD5SHA(@client_write_MAC_secret,  // Secret
+      HMAC_ShaMd5(@client_write_MAC_secret,  // Secret
                   20,             // Secret length
                   @toEncrypt,     // Data to hash
                   29           ,  // Data length
@@ -1749,129 +1760,135 @@ end;
 // - labelLength must be even and it must not include a trailing zero
 // - secretKeyLength must be even
 // - prfLength is of max size of 255
-procedure PRF(secretKey: ^byte; secretKeyLength: word;
-              aLabel: ^byte; labelLength: word;
-              seed: ^byte; seedLength: word;
-              prfOut: ^byte; prfLength: word);
-var s1, s2: array[64] of byte;
-    i, L_S: byte;
-    aMD5, hMD5: array[16] of char;
-    aSHA1, hSHA1: array[20] of char;
-    labelAndSeed: array[128] of byte;
-    p: ^byte;
-    numberOfIterations: byte;
-    evenOdd: byte;
-    seedArray: array[64] of byte;
-    labelArray: array[32] of byte;
+procedure P_Hash
+             (secretKey: ^byte; secretKeyLength: word;
+              seed     : ^byte; seedLength: word;
+              hashOut  : ^byte; hashOutLength: word;
+              sha1Md5  : byte);
+var i: byte;
+    aHash, hHash: array[20] of byte;
+    aAndSeed: array[255] of byte;
+    hashSize: byte;
+    msg: string[5];
+    seedArray: array[128] of byte;
 begin
-  evenOdd := 0;
+{Word2Str(secretKeyLength, msg);
+  UART3_Write_Text(' secretKeyLength: ');
+  UART3_Write_Text(msg);
+
+  Word2Str(seedLength, msg);
+  UART3_Write_Text(' seedLength: ');
+  UART3_Write_Text(msg);
+
+  Word2Str(hashOutLength, msg);
+  UART3_Write_Text(' hashOutLength: ');
+  UART3_Write_Text(msg);}
+  
   for i := 0 to seedLength - 1 do
     begin
       seedArray[i] := seed^;
       inc(seed);
     end;
-  for i := 0 to labelLength - 1 do
-    begin
-      labelArray[i] := aLabel^;
-      inc(alabel);
-    end;
-  if secretKeyLength and 0x01 = 0x01 then //odd
-    evenOdd := 1;
-  L_S := secretKeyLength div 2;
-  for i := 0 to L_S - 1 + evenOdd do
-    begin
-      s1[i] := secretKey^;
-      inc(secretKey);
-    end;
-  for i := L_S to secretKeyLength - 1 do
-    begin
-      s2[i - L_S] := secretKey^;
-      inc(secretKey);
-    end;
-  for i := 0 to labelLength - 1 do
-    begin
-      labelAndSeed[i] := labelArray[i];
-      labelAndSeed[i] := labelArray[i];
-    end;
+      
+  //uart3_write_text('here 1');
+  if sha1Md5 = 0 then
+    hashSize := 20
+  else
+    hashSize := 16;
+
+  // A0 = seed
+  // A1 = hmac(secret, seed) = hmac(secret, A0)
+  // P_Hash1 = hmac(secret, A1 + seed);
+
+  // A2 = hmac(secret, A1)
+  // P_Hash2 = hmac(secret, A2 + seed);
+  
+  // A1
+  HMAC_ShaMd5(secretKey, secretKeyLength,
+              @seedArray, seedLength,
+              @aHash, // this is A1
+              sha1Md5);
+  // build A1 + seed
+  for i := 0 to hashSize - 1 do
+    aAndSeed[i] := aHash[i];
   for i := 0 to seedLength - 1 do
     begin
-      labelAndSeed[labelLength + i] := seedArray[i];
-      labelAndSeed[labelLength + i] := seedArray[i];
+      aAndSeed[i + hashSize] := seedArray[i];
     end;
-  
-  numberOfIterations := prfLength div 16;
-  numberOfIterations := numberOfIterations + 1; // make sure we exceed the wanted length
-  //A0
-  p := @labelAndSeed;
-  //p := p + 16;
-  HMAC_MD5SHA(@s1, L_S, p, labelLength + seedLength,  aMD5, 1);
-  while numberOfIterations > 0 do
+
+  while hashOutLength > 0 do
     begin
-      //Ai
-      for i := 0 to 15 do
+      // calculate PHash = hmac(secret, A + seed)
+      HMAC_ShaMd5(secretKey, secretKeyLength,
+                  @aAndSeed, hashSize + seedLength,
+                  @hHash,   // this is P_Hash
+                  sha1Md5);
+      for i := 0 to hashSize - 1 do
         begin
-          labelAndSeed[i] := aMD5[i];
+          hashOut^ := hHash[i];
+          inc(hashOut);
+          dec(hashOutLength);
+          if hashOutLength = 0 then
+            break;
         end;
-      for i := 0 to labelLength - 1 do
+      // Set A for next iteration
+      // A(i) = HMAC_hash( secret, A(i-1) )
+      HMAC_ShaMd5(secretKey, secretKeyLength,
+                  @aHash, hashSize,
+                  @hHash,
+                  sha1Md5);
+      for i := 0 to hashSize - 1 do
         begin
-          labelAndSeed[i + 16] := labelArray[i];
-          labelAndSeed[i + 16] := labelArray[i];
+          aAndSeed[i] := hHash[i];
+          aHash[i]    := hHash[i];
         end;
       for i := 0 to seedLength - 1 do
         begin
-          labelAndSeed[labelLength + i + 16] := seedArray[i];
-          labelAndSeed[labelLength + i + 16] := seedArray[i];
+          aAndSeed[i + hashSize] := seedArray[i];
         end;
-      p := @labelAndSeed;
-      HMAC_MD5SHA(@s1, L_S, p, 16 + seedLength + labelLength,  aMD5{hMD5}, 1);
-      dec(numberOfIterations);
     end;
-  for i := 0 to 15 do
-    hMD5[i] := aMD5[i];
+  // uart3_write_text(' here 5 ');
+end;
 
-  numberOfIterations := prfLength div 20;
-  numberOfIterations := numberOfIterations + 1; // make sure we exceed the wanted length
+// - labelLength must be even and it must not include a trailing zero
+// - secretKeyLength must be even
+// - prfLength is of max size of 255
+procedure PRF(secretKey: ^byte; secretKeyLength: word;
+              aLabel   : ^byte; labelLength: word;
+              seed     : ^byte; seedLength: word;
+              PRFOut   : ^byte; prfLength: word);
+var halfSecretLength: word;
+    sha1Out: array[255] of byte;
+    i : byte;
+    msg : string[5];
+    concat: string[255];
+begin
+  halfSecretLength := (secretKeyLength div 2) + (secretKeyLength mod 2);
   
   for i := 0 to labelLength - 1 do
     begin
-      labelAndSeed[i] := aLabel^;
-      labelAndSeed[i] := aLabel^;
+      concat[i] := aLabel^;
       inc(aLabel);
     end;
-  for i := 0 to seedLength - 1 do
+  for i := 0 to  seedLength- 1 do
     begin
-      labelAndSeed[labelLength + i] := seedArray[i];
-      labelAndSeed[labelLength + i] := seedArray[i];
+      concat[i + labelLength] := seed^;
+      inc(seed);
     end;
-  p := @labelAndSeed;
-  HMAC_MD5SHA(@s2, L_S, p, labelLength + seedLength, aSHA1, 0);
   
-  while numberOfIterations > 0 do
-    begin
-      for i := 0 to 19 do
-        begin
-          labelAndSeed[i] := aSHA1[i];
-        end;
-      for i := 0 to seedLength - 1 do
-        begin
-          labelAndSeed[i + 20] := seedArray[i];
-        end;
-      for i := 0 to seedLength - 1 do
-        begin
-          labelAndSeed[labelLength + i + 20] := seedArray[i];
-          labelAndSeed[labelLength + i + 20] := seedArray[i];
-        end;
-      p := @labelAndSeed;
-      HMAC_MD5SHA(@s2, L_S, p, 20 + seedLength + labelLength,  aSHA1{hSHA1}, 0);
-      dec(numberOfIterations);
-    end;
-  for i := 0 to 19 do
-    hSHA1[i] := aSHA1[i];
-    
+  P_Hash(secretKey, halfSecretLength, 
+         @concat, labelLength + seedLength,
+         PRFOut, prfLength, 
+         1); // md5
+         
+  P_Hash(secretKey + (secretKeyLength div 2), halfSecretLength, 
+         @concat, labelLength + seedLength,
+         @sha1Out, prfLength, 
+         0); // sha-1
   for i := 0 to prfLength - 1 do
     begin
-      prfOut^ := hMD5[i] xor hSHA1[i];
-      inc(prfOut);
+      PRFOut^ := PRFOut^ xor sha1Out[i];
+      inc(PRFOut);
     end;
 end;
 
