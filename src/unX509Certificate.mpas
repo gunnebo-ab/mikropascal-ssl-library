@@ -6,9 +6,9 @@ const OID_RSA = '1.2.840.113549.1.1.1';
 
 type TRSAKey = record
     ExponentLength: word;
-    BaseLength: word;
+    ModulusLength: word;
     Exponent: string[10];
-    Base: string[512];
+    Modulus: string[512];
   end;
   
 type TPublicKey = record
@@ -21,12 +21,6 @@ type TX509Certificate = record
   SerialNumber: Array[12] of byte;
   PublicKey: TPublicKey;
 end;
-
-// how to parse OID?
-type TOid = record
-    b: byte;
-  end;
-
 
 {
         case 0x00: return "EOC";
@@ -70,6 +64,7 @@ const ASN1_EOC = 0x00;
       ASN1_T61_STRING = 0x14;
       ASN1_IA5_STRING = 0x16;
       ASN1_UTC_TIME = 0x17;
+      ASN1_UTF8_STRING = 0x0C;
       ASN1_ARRAY = 0xA0; // ???
       ASN1_SEQUENCE0 = 0x30;
       //ASN1_SEQUENCE1 = 0x82; // todo: not a constant
@@ -111,23 +106,23 @@ const ASN1_EOC = 0x00;
       2a 86 48 86 f7 0d 01 01 0b
 }
 
-function DecodeCertificate(var certificate: string[4096]; var outCertificate: TX509Certificate; var startIndex: word): boolean;
+function DecodeCertificate(var certificate: string[4096]; var outCertificate: TX509Certificate; startIndex: word): boolean;
 procedure X509Init(var certificate: string[4096]; certificateLength: word);
 function X509Init2(var certificate: string[4096]): word;
-
 
 implementation
 
 var stateMachine: byte;
-    oidRSA: string[24];
+    oidRSA: string[32];
     totalLength: word;
+    sequenceLevel: byte;
 
 // returns length of the certificate
 procedure X509Init(var certificate: string[4096]; certificateLength: word);
 var i: byte;
 begin
   stateMachine := 1;
-
+  sequenceLevel := 0;
   //**** specific oid
   for i := 0 to 19 do
     oidRSA[i] := OID_RSA[i];
@@ -175,6 +170,8 @@ var
   len: word;
   tmp: string[10];
 begin
+  for len := 0 to 10 do
+    tmp[len] := 0;
   Result := '';
   n := 0;
   len := Str_Len(Id);
@@ -192,7 +189,6 @@ begin
     Result := Result + tmp;
   end;
 end;
-
 
 // convert hex number at index to a number
 function getByteInternal(var certificate: string[4096]; index: word): byte;
@@ -221,14 +217,23 @@ function getBytesInternal(var certificate: string[4096]; index: word; numOfBytes
 var hexValue: array[2] of byte;
     i: byte;
 begin
+  hexValue[0] := 0;
+  hexValue[1] := 0;
   for i := 0 to numOfBytes - 1 do
     begin
       hexValue[i] := certificate[index];
       inc(index);
     end;
 
-  result := hexValue[0] shl 8;
-  result := result or hexValue[1];
+  if numOfBytes = 1 then
+    begin
+      result := hexValue[0];
+    end
+  else
+    begin
+      result := hexValue[0] shl 8;
+      result := result or hexValue[1];
+    end;
 end;
 
 // convert hex number at index to a number                            // maximum 4 bytes
@@ -251,6 +256,80 @@ begin
   result := Hex2Word(hexValue);
 end;
 
+function ParseNull(var certificate: string[4096]; var outCertificate: TX509Certificate; startIndex: word): word;
+begin
+  inc(startIndex); // null
+  inc(startIndex); // next tag
+  result := 2;
+end;
+
+function ParseSequence(var certificate: string[4096]; var outCertificate: TX509Certificate; startIndex: word): word;
+var length, j: word;
+    octetLength, parsedBytes: word;
+begin
+    inc(sequenceLevel);
+    inc(startIndex);
+    length := certificate[startIndex];
+    octetLength := 0;
+    inc(startindex); // move to octets/data
+    if length and 0x80 = 0x80 then // longer than 127 bytes
+      begin
+        octetLength := length and 0x7F;
+        length := getBytesInternal(certificate, startIndex, octetLength);
+        for j := 1 to octetLength do // move to data
+          Inc(startIndex);
+      end;
+    // we have the sequence length, loop through it
+    result := 1 + 1 + octetLength; // tag, length, octetlength
+    while length > 0 do
+      begin
+        parsedBytes := DecodeCertificate(certificate, outCertificate, startIndex);
+        result := result + parsedBytes;
+        startIndex := startIndex + parsedBytes;
+        if parsedBytes = 0 then
+          begin
+            dec(sequenceLevel);  // todo: error
+            exit; // we are done
+          end;
+        if length >= parsedBytes then
+          begin
+            length := length - parsedBytes;
+          end
+        else
+          begin
+            length := 0; // todo: error
+          end;
+      end;
+    dec(sequenceLevel);
+end;
+
+function ParseSet(var certificate: string[4096]; var outCertificate: TX509Certificate; startIndex: word): word;
+var length, parsedBytes: word;
+begin
+  inc(startIndex); // 0x31
+  length := certificate[startIndex];
+  inc(startIndex); // next tag
+  result := 2;
+  while length > 0 do
+    begin
+      parsedBytes := DecodeCertificate(certificate, outCertificate, startIndex);
+      result := result + parsedBytes;
+      startIndex := startIndex + parsedBytes;
+
+      if parsedBytes = 0 then
+        begin
+          //todo:  an error occured
+          exit; // we are done
+        end;
+      if length >= parsedBytes then
+        begin
+          length := length - parsedBytes;
+        end
+      else
+        length := 0;
+    end;
+end;
+
 {
   state machine
     state
@@ -262,8 +341,8 @@ end;
       5 - wait for public key exponent
       6 - public key done
 }
-
-function DecodeCertificate(var certificate: string[4096]; var outCertificate: TX509Certificate; var startIndex: word): boolean;
+// returns number of parsed bytes
+function DecodeCertificate(var certificate: string[4096]; var outCertificate: TX509Certificate; startIndex: word): word;
 var j: word;
     octetLength, length : word;
     currentByte, nextByte: byte;
@@ -274,113 +353,85 @@ var j: word;
     printableString: string[64];
     parsedBytes: word;
     dbgtxt: string[5];
+    blockType: string[10];
+    signByte: byte;
 begin
-  //ClrWDT();
-//  Word2Str(startIndex, dbgtxt);
-//  UART3_Write(32);
-//  UART3_Write_Text(dbgtxt);
-  result := false; // error occured
-
-    if startindex >= 300 then
-      nop;
+  result := 0;
+  ClrWDT();
   // in case we extracted the public key, there is no need to parse further.
   if stateMachine >= 6 then
     begin
       startIndex := totalLength;
-      result := true;
       exit;
     end;
 
-      //currentByte := getByteInternal(certificate, startIndex);
       currentByte := certificate[startIndex];
       case currentByte of
         ASN1_NULL: //
           begin
-            inc(startIndex); // null
-            inc(startIndex); // next tag
+            result := ParseNull(certificate, outCertificate, startIndex);
           end;
         ASN1_SET, ASN1_SET2: //
           begin
-            inc(startIndex);
-            //length := getByteInternal(certificate, startIndex);
-            length := certificate[startIndex];
-            inc(startIndex); // next tag
+            result := ParseSet(certificate, outCertificate, startIndex);
           end;
         ASN1_SEQUENCE0: //
           begin
-            nop;
-            //UART3_Write_Text(' here ');
-            inc(startIndex);
-            //length := getByteInternal(certificate, startIndex);
-            length := certificate[startIndex];
-            if length and 0x80 = 0x80 then // longer than 127 bytes
-              begin
-                octetLength := length and 0x7F;
-                inc(startindex);
-                length := getBytesInternal(certificate, startIndex, octetLength);
-                inc(startIndex);
-              end;
-            // we have the sequence length, loop through it
-            inc(startIndex);
-            //result := true;
-
-            //exit;
-            while length > 0 do
-              begin
-                parsedBytes := startIndex;
-                DecodeCertificate(certificate, outCertificate, startIndex);
-                parsedBytes := startIndex - parsedBytes;
-                if parsedBytes = 0 then
-                  exit; // we are done
-                if length > parsedBytes then
-                  length := length - parsedBytes
-                else
-                  length := 0;
-              end;
+            result := ParseSequence(certificate, outCertificate, startIndex);
           end;  // asn1 sequence start
         ASN1_OBJECT_IDENTIFIER: //
           begin
-            nop;
-//            UART3_Write_Text(' here2 ');
-            inc(startIndex);
-            //length := getByteInternal(certificate, startIndex);
-            length := certificate[startIndex];
-            inc(startIndex);
-            // now we have the length of the oid, let's store it
             for j := 0 to 63 do
-              oid[j] := 0;
-            for j := 1 to length do
               begin
-                //oid[j-1] := getByteInternal(certificate, startIndex);
-                oid[j-1] := certificate[startIndex];
-                inc(startIndex);
+                oid[j] := 0;
+                oidText[j] := 0;
               end;
             
-            // oid is detected, check which one it is
-            oidText := IdToMib(oid);
-            nop;
-            
-            if stateMachine = 3 then // waiting for encryption
+            inc(startIndex);
+            length := certificate[startIndex];
+            result := 0;
+            if length > 64 then
               begin
-//                UART3_Write_Text(' here3 ');
-                if str_Cmp(oidText, oidRSA) = 0 then
+                // oid too long
+                // todo: error
+              end
+            else
+              begin
+                result := 1 + 1 + length;
+                inc(startIndex);
+                // now we have the length of the oid, let's store it
+
+                for j := 1 to length do
                   begin
-                    length := Str_Len(oidText);
-                    for j := 0 to length - 1 do
-                      outCertificate.PublicKey.EncryptionMethod[j] := oidText[j];
-                    outCertificate.PublicKey.EncryptionMethod[length] := 0; // zero terminator
-                    nop;
-                    stateMachine := 4; // wait for public key base and exponent
+                    //oid[j-1] := getByteInternal(certificate, startIndex);
+                    oid[j-1] := certificate[startIndex];
+                    inc(startIndex);
+                  end;
+
+                // oid is detected, check which one it is
+                oidText := IdToMib(oid);
+
+                if stateMachine = 3 then // waiting for encryption
+                  begin
+                    if str_Cmp(oidText, oidRSA) = 0 then
+                      begin
+                        length := Str_Len(oidText);
+                        for j := 0 to length - 1 do
+                          outCertificate.PublicKey.EncryptionMethod[j] := oidText[j];
+                        outCertificate.PublicKey.EncryptionMethod[length] := 0; // zero terminator
+                        nop;
+                        stateMachine := 4; // wait for public key base and exponent
+                      end
+                    else
+                      begin
+                         // not an oidRSA
+                      end;
                   end;
               end;
-              
           end;
-        ASN1_PRINTABLE_STRING: //
+        ASN1_PRINTABLE_STRING, ASN1_UTF8_STRING: //
           begin
-            nop;
             inc(startIndex);
-            //UART3_Write_Text(' here4 ');
-            //length := getByteInternal(certificate, startIndex);
             length := certificate[startIndex];
             printableString[0] := 0;
             for j := 1 to length do
@@ -388,6 +439,7 @@ begin
                 printableString[j-1] := certificate[startIndex];
                 inc(startIndex);
               end;
+            result := 1 + 1 + length;
           end;
         ASN1_BIT_STRING: //
           begin
@@ -403,51 +455,87 @@ begin
             
             inc(startIndex); // skip T
             octetLength := certificate[startIndex]; //getByteInternal(certificate, startIndex);  // bit string length
-            octetLength := octetLength and 0x7F; // strip the first bit
-            // octet length now says how many bytes is the actual length
-            inc(startIndex);
-            length := getBytesInternal(certificate, startIndex, octetLength); //
-           {for j := 1 to octetLength do
-              inc(startIndex);}
-            inc(startIndex); // skip V
 
-            // continue with parsing
-            DecodeCertificate(certificate, outCertificate, startIndex);
-            //result := true;
-            //exit; // to avoid cross calling and recursion, but then you must loop in the caller
+             if ((octetLength and 0x80) = 0x80) then // longer than 127 bytes
+              begin
+                octetLength := octetLength and 0x7F;
+                inc(startindex);
+                length := getBytesInternal(certificate, startIndex, octetLength);
+                for j := 1 to octetLength - 1 do // note: -1 because there is another increment in the for loop below
+                   Inc(startIndex);
+              end;
+            
+            inc(startIndex); // skip V
+            
+            inc(startIndex); // next object
+            result := 3;
+            while length > 0 do
+              begin
+                parsedBytes := DecodeCertificate(certificate, outCertificate, startIndex);
+                result := result + parsedBytes;
+                startindex := startindex + parsedBytes;
+
+                if parsedBytes = 0 then
+                  begin
+                    exit; // we are done
+                  end;
+                if length >= parsedBytes then
+                  begin
+                    length := length - parsedBytes;
+                  end
+                else
+                  length := 0;
+              end;
           end;
-        ASN1_OCTET_STRING: //
+        ASN1_OCTET_STRING: // todo:
           begin
             inc(startIndex);
             octetLength := certificate[startIndex]; //getByteInternal(certificate, startIndex);
             {
               do something with octet length
             }
-            inc(startIndex); // next tag
+            result := octetLength + 2;
           end; // octet string
         ASN1_ARRAY: //
           begin
              inc(startIndex);
-             length := certificate[startIndex]; //getByteInternal(certificate, startIndex);
+             length := certificate[startIndex];
              inc(startIndex); // next tag
+             result := 1 + 1;
+             while length > 0 do
+              begin
+                parsedBytes := DecodeCertificate(certificate, outCertificate, startIndex);
+                result := result + parsedBytes;
+                startindex := startindex + parsedBytes;
+                if parsedBytes = 0 then
+                  begin
+                    exit; // todo: error
+                  end;
+                if length >= parsedBytes then
+                  begin
+                    length := length - parsedBytes;
+                  end
+                else
+                  length := 0;
+              end;
           end; // array
         ASN1_INTEGER: //
           begin
              inc(startIndex);
-             length := certificate[startIndex]; //getByteInternal(certificate, startIndex);
+             length := certificate[startIndex];
+             octetLength := 0;
+             inc(startIndex); // move to octets/data
              if length and 0x80 = 0x80 then // more than 127 bytes?
                begin
                  octetLength := length and 0x7F;
-                 inc(startIndex);
-                 //length := getBytesInternal(certificate, startIndex, octetLength * 2);
                  length := getBytesInternal(certificate, startIndex, octetLength );
-                 for j := 1 to octetLength - 1 do // note: -1 because there is another increment in the for loop below
+                 for j := 1 to octetLength do
                    Inc(startIndex);
                end;
+             result := 1 + 1 + octetLength + length;
              for j := 1 to length do
                begin
-                 inc(startIndex); // move to value
-                 value := certificate[startIndex]; //getByteInternal(certificate, startIndex);
+                 value := certificate[startIndex];
                  case stateMachine of
                     1: // waiting for version number
                       begin
@@ -456,6 +544,7 @@ begin
                       end;
                     2: // waiting for the version number
                       begin
+                        // todo: check length
                         outCertificate.SerialNumber[j-1] := value;
                         if j = length then // done here, move to next state, get encryption and public key
                           begin
@@ -464,14 +553,31 @@ begin
                       end;
                      4: // waiting for the public key base
                       begin
-                        outCertificate.PublicKey.Key.Base[j-1] := value;
+                        if length > 512 then
+                          begin
+                            result := 0; // error, base too long
+                            exit;
+                          end;
+                        // important check:
+                        //  reason for the 00h valued byte at the start is because BigInteger.toByteArray() returns the signed representation. As long as the key length in bits is N*8 (or key length % 8 = 0) then the signed representation of an RSA modulus will always feature a 00h valued byte at the start.
+                        if (j = 1) then
+                          begin
+                            if (value = 0) then
+                              begin // ignore the first zero and add one extra byte
+                                signByte := 1;
+                                inc(startIndex);
+                                continue;
+                              end
+                            else
+                              begin
+                                signByte := 0;
+                              end;
+                          end;
+                        outCertificate.PublicKey.Key.Modulus[j - 1 - signByte] := value;
                         if j = length then // done here, move to next state, get encryption and public key
                           begin
                             stateMachine := 5; // wait for the PK exponent
-                            outCertificate.PublicKey.Key.BaseLength := length;
-//                            uart3_write(0xAA);uart3_write(0xAA);uart3_write(0xAA);
-//                            uart3_write(Hi(Length));
-//                            uart3_write(Lo(Length));
+                            outCertificate.PublicKey.Key.ModulusLength := length - signByte;
                           end;
                       end;
                     5: // waiting for the public key exponent
@@ -481,41 +587,49 @@ begin
                           begin
                             stateMachine := 6; // key done
                             outCertificate.PublicKey.Key.ExponentLength := length;
-
                           end;
                       end;
                  end; // case of stateMachine
+                inc(startIndex);
                end;
-            inc(startIndex); // next tag
           end; // end case of integer
         ASN1_IA5_STRING: //
           begin
              inc(startIndex);
              length := certificate[startIndex]; //getByteInternal(certificate, startIndex);
+             inc(startIndex); // move to octets/data
+             octetLength := 0;
              if length and 0x80 = 0x80 then // more than 127 bytes?
                begin
                  octetLength := length and 0x7F;
-                 inc(startIndex);
-                 //length := getBytesInternal(certificate, startIndex, octetLength * 2);
                  length := getBytesInternal(certificate, startIndex, octetLength);
-                 for j := 1 to octetLength - 1 do // note: -1 because there is another increment in the for loop below
+                 for j := 1 to octetLength do
                    Inc(startIndex);
                end;
+
+             result := 1 + 1 + octetLength + length;
              for j := 1 to length do
                begin
-                 inc(startIndex); // move to value
                  // uncomment if needed
                  //value := getByteInternal(certificate, startIndex);
+                 inc(startIndex); // move to next value
                end;
-             inc(startIndex); // next tag
-          end
-        else // everything else
+          end;
+        ASN1_UTC_TIME: //
           begin
             inc(startIndex);
+            length := certificate[startIndex];
+            // todo: get time
+            for j := 1 to length do
+              inc(startIndex); // skip time, for now
+            result := 1 + 1 + length;
+          end
+        else // everything else, todo: should result in an error of unknown tag
+          begin
+            inc(startIndex);
+            result := 0;
           end;
       end; // case
-  result := true;
 end;
-
 
 end.
