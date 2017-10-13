@@ -46,7 +46,11 @@ var toHashMD5, toHashSHA1: TtoHash;
 
 implementation
 
-
+// NOTE: Tracing sensitive information in production can be a disaster.
+// However, during a debug some information is needed.
+// The following directive activates tracing of sensitive info.
+// In production code you certainly do not want this directive to be enabled!
+{$DEFINE TraceSensitiveInformation}
 
 const HASHLST = 12;   // ECON1
       HASHOP  = 13;   // ECON1
@@ -132,6 +136,7 @@ var serverCertificateStartIndex: word;
     sessionIDLength: byte;
     helloDoneStartIndex: word;
 
+
 procedure Random_Init;
 begin
   LoWord(m_z) := TMR1;
@@ -141,14 +146,27 @@ begin
 end;
 
 function Random : dword;
+var i: byte;
+    an1Input: word;
 begin
   m_z := 36969 * (m_z and 65535) + (m_z shr 16);
   m_w := 18000 * (m_w and 65535) + (m_w shr 16);
   result := (m_z shl 16) + m_w;
+ {exit;
+  // another way: read an analog pin and take the lowest bit (it fluctuates if opened)
+  // adc1_init() must be called before using the ADC module
+  result := 0;
+  for i := 0 to 31 do
+    begin
+      an1Input := ADC1_Get_Sample(8);
+      result := result or an1Input.0; // take bit 0 (should  be a Random fluctuation)
+      result := result shl 1;         // shift left until all bits filled in with Random bit
+    end;}
 end;
 
 procedure AnalyzeRandom;
 begin
+  Random_Init();
   m_r := Random;
   while ((Lo(m_r) = 0) or (Hi(m_r) = 0) or (Higher(m_r) = 0) or (Highest(m_r) = 0)) do m_r := Random;
 end;
@@ -681,6 +699,28 @@ begin
     end;
 end;
 
+// if current debug level is higher than requested
+//  then print out debug information
+// * traceType:
+//   1 - error
+//   2 - warning
+//   4 - debug
+//   8 - log
+// the values are OR-ed together to make combinations
+procedure TraceOut(var debugData: array[4096] of byte; debugDataLength: word; traceLevel, traceType: byte);
+begin
+  if (udpDebugLevel >= traceLevel) then
+    begin
+      {UART3_Write(udpDebugLevel);
+      UART3_Write(traceLevel);
+      UART3_Write(udpTraceType);}
+    if ((traceType and udpTraceType) = traceType) then
+      begin
+        out_broadcast_local(33335, debugDataLength, debugData);
+      end;
+    end;
+end;
+
 procedure SSL_Init;
 begin
   HTTP_send_Port_ssl := TMR1 + 23456;
@@ -729,28 +769,22 @@ again_:
         begin
           if Dns_Resolve(server_address_url,server_addr) = false then
             begin
-              if UDP_debug <> 0 then
-                begin
-                  Socket_TCP_buf := 'DNS fail';
-                  out_broadcast_local(33335,Str_Len(Socket_TCP_buf),Socket_TCP_buf);
-                end;
+              Socket_TCP_buf := 'DNS fail';
+              TraceOut(Socket_TCP_buf, Str_Len(Socket_TCP_buf), 1, TRACE_TYPE_ERROR);
               goto end_end_;
             end
           else
             begin
-              {if UDP_debug <> 0 then
-                begin
-                  Socket_TCP_buf := 'DNS resolved';
-                  out_broadcast_local(33335, Str_Len(Socket_TCP_buf), Socket_TCP_buf);
-                end;}
+              Socket_TCP_buf := 'DNS resolved';
+              TraceOut(Socket_TCP_buf, Str_Len(Socket_TCP_buf), 6, TRACE_TYPE_LOG);
             end;
         end
       else
         begin
           Socket_TCP_buf := 'DNS resolved';
-          out_broadcast_local(33335, Str_Len(Socket_TCP_buf),Socket_TCP_buf);
+          TraceOut(Socket_TCP_buf, Str_Len(Socket_TCP_buf), 6, TRACE_TYPE_LOG);
           Mem_Cpy(@Socket_TCP_buf, @server_addr, 4);
-          out_broadcast_local(33335, 4, Socket_TCP_buf);
+          TraceOut(Socket_TCP_buf, Str_Len(Socket_TCP_buf), 6, TRACE_TYPE_LOG);
         end;
     end;
   o_sock_ssl := 11;
@@ -791,19 +825,13 @@ begin
   // check if socket is connected
   if Socket[o_sock_ssl].State_S <> 2 then 
     begin
-      if UDP_debug <> 0 then
-          begin
-            msg := 'Socket disconnected';
-            out_broadcast_local(33335, 19, msg);
-          end;
+      msg := 'Socket disconnected';
+      TraceOut(msg, 19, 1, TRACE_TYPE_ERROR);
       exit;
     end;
 
-      if UDP_debug <> 0 then
-        begin
-          out_broadcast_local(33335, messageLength, HTTP_data_out);
-        end;
-      
+    TraceOut(HTTP_data_out, messageLength, 3, TRACE_TYPE_LOG);
+
       // hash outgoing handshake messages, without headers
       if HTTP_data_out[0] = TLS_CONTENT_HANDSHAKE then
         begin
@@ -832,12 +860,8 @@ begin
         begin
           if CC0_TCP > 49 then 
             begin
-              if UDP_debug <> 0 then
-                begin
-                  msg := 'Timeout on send';
-                  out_broadcast_local(33335, 15, msg);
-                end;
-
+              msg := 'Timeout on send';
+              TraceOut(msg, Str_Len(msg), 1, TRACE_TYPE_ERROR);
               break; // fail in 4 sec
             end;
 
@@ -872,14 +896,13 @@ begin
       // choose pre master secret
       Random_Array_46(@preMasterSecret.random);
       
-     {if UDP_debug then
-        begin
-          msg := 'preMasterSecret random';
-          out_broadcast_local(33335, Str_Len(msg), msg);
-          out_broadcast_local(33335,
-                              46,
-                              preMasterSecret.random);
-        end;}
+      {$IFDEF TraceSensitiveInformation}
+        msg := 'preMasterSecret random';
+        TraceOut(msg, Str_Len(msg), 1, TRACE_TYPE_DEBUG);
+        out_broadcast_local(33335,
+                            46,
+                            preMasterSecret.random);
+      {$ENDIF}
       
       // set the TLS version
       preMasterSecret.clientVersion[0] := TLS_VERSION_HIGH;
@@ -900,24 +923,21 @@ begin
            HTTP_data_out[82 + i] := preMasterSecret.random[i];
         end;
       
-      {if UDP_debug <> 0 then
           begin
-            msg := 'public key: exp/base';
-            out_broadcast_local(33335, Str_Len(msg), msg);
-            msg[0] := Hi(ServerCertificate.PublicKey.Key.ExponentLength);
-            msg[1] := Lo(ServerCertificate.PublicKey.Key.ExponentLength);
-            out_broadcast_local(33335, 2, msg);
-
-            msg[0] := Hi(ServerCertificate.PublicKey.Key.ModulusLength);
-            msg[1] := Lo(ServerCertificate.PublicKey.Key.ModulusLength);
-            out_broadcast_local(33335, 2, msg);
-          end;}
+            msg := 'public key: exp/base length: ';
+            i := Str_Len(msg);
+            msg[i]     := Hi(ServerCertificate.PublicKey.Key.ExponentLength);
+            msg[i + 1] := Lo(ServerCertificate.PublicKey.Key.ExponentLength);
+            msg[i + 3] := Hi(ServerCertificate.PublicKey.Key.ModulusLength);
+            msg[i + 4] := Lo(ServerCertificate.PublicKey.Key.ModulusLength);
+            TraceOut(msg, i + 4, 1, TRACE_TYPE_DEBUG);
+          end;
       
       // RSA encrypt PreMaster Secret
       i := modexp(rsaCipherText, // Y
              ServerCertificate.PublicKey.Key.Exponent, // E
              ServerCertificate.PublicKey.Key.ExponentLength,
-             HTTP_data_out,  // pre master secret   // X or base B
+             HTTP_data_out,   // PreMasterSsecret   // X or base B
              128,             // PreMasterSecret length with padding
              ServerCertificate.PublicKey.Key.Modulus, // M
              ServerCertificate.PublicKey.Key.ModulusLength
@@ -927,7 +947,7 @@ begin
         begin
            msg := 'modexp failed N'; /// N = error code
            msg[14] := i;
-           out_broadcast_local(33335, Str_Len(msg), msg);
+           TraceOut(msg, 15, 1, TRACE_TYPE_ERROR);
            result := 0;
            exit;
         end;
@@ -1097,36 +1117,68 @@ begin
     server_write_IV[i-88]  := keys[i];
 end;
 
-procedure CalculateVerifyData(var verifyDataOut: array[12] of byte);
+function CalculateVerifyData(var verifyDataOut: array[12] of byte): byte;
 var seed: array[36] of byte;   //md5 (16 bytes) + sha-1 (20 bytes)
     i: byte;
     aLabel: string[15];
 begin
-      aLabel := 'client finished';
-      // copy MD5
-      for i := 0 to 15 do
-        begin
-          seed[i] := MD5Hash[i];
-        end;
-      // copy SHA-1
-      for i := 0 to 19 do
-        begin
-          seed[i + 16] := SHA1Hash[i];
-        end;
-
-     // compute verify data
-     i := Prf (@MasterSecret,
-               48,             // Master Secret Length
-               @aLabel,        // label
-               15,             // label length
-               @seed,          // seed
-               36,             // seed length
-               @verifyDataOut, // verify_data
-               12);            // verify_data length
-     if i <> 0 then
+    aLabel := 'client finished';
+    // copy MD5
+    for i := 0 to 15 do
       begin
-        // PRF Failed
+        seed[i] := MD5Hash[i];
       end;
+    // copy SHA-1
+    for i := 0 to 19 do
+      begin
+        seed[i + 16] := SHA1Hash[i];
+      end;
+
+   // compute verify data
+   result := Prf (@MasterSecret,
+             48,             // Master Secret Length
+             @aLabel,        // label
+             15,             // label length
+             @seed,          // seed
+             36,             // seed length
+             @verifyDataOut, // verify_data
+             12);            // verify_data length
+   if i <> 0 then
+    begin
+      // PRF Failed
+    end;
+end;
+
+function CalculateServerVerifyData(var verifyDataOut: array[12] of byte): byte;
+var seed: array[36] of byte;   //md5 (16 bytes) + sha-1 (20 bytes)
+    i: byte;
+    aLabel: string[15];
+begin
+  aLabel := 'server finished';
+  // copy MD5
+  for i := 0 to 15 do
+    begin
+      seed[i] := MD5Hash[i];
+    end;
+  // copy SHA-1
+  for i := 0 to 19 do
+    begin
+      seed[i + 16] := SHA1Hash[i];
+    end;
+
+ // compute verify data
+  result := Prf (@MasterSecret,
+           48,             // Master Secret Length
+           @aLabel,        // label
+           15,             // label length
+           @seed,          // seed
+           36,             // seed length
+           @verifyDataOut, // verify_data
+           12);            // verify_data length
+ if result <> 0 then
+  begin
+    // PRF Failed
+  end;
 end;
 
 function CreateClientFinished(): word; // returns number of bytes
@@ -1153,7 +1205,7 @@ begin
       CalculateKeys(masterSecret);
      
       // compute verify data
-      CalculateVerifyData(verifyData);
+      CalculateVerifyData(verifyData); // todo: check result
       // build a "client finished" message
       // the Plan:
       //   1. calculate HMAC on associated data + verify data
@@ -1295,12 +1347,9 @@ begin
 
                if counter = 37 then
                  begin
-                   {if UDP_debug <> 0 then
-                      begin
-                        debugMsg := 'Server Random';
-                        out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                        out_broadcast_local(33335, 32, serverRandom);
-                      end;}
+                    debugMsg := 'Server Random';
+                    TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                    TraceOut(serverRandom, 32, 6, TRACE_TYPE_LOG);
                  end;
              end;
             
@@ -1327,20 +1376,19 @@ begin
             begin
               serverCompressionMethod := host_response[locali];
 
-              {if UDP_debug <> 0 then
                 begin
                   debugMsg := 'sessionID';
-                  out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                  out_broadcast_local(33335, sessionIDLength, sessionID);
+                  TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                  TraceOut(sessionID, sessionIDLength, 6, TRACE_TYPE_LOG);
 
                   debugMsg := 'serverCipherSuite';
-                  out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                  out_broadcast_local(33335, 2, serverCipherSuite);
+                  TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                  TraceOut(serverCipherSuite, 2, 6, TRACE_TYPE_LOG);
 
                   debugMsg := 'serverCompressionMethod N';
                   debugMsg[Str_Len(debugMsg) - 1] := serverCompressionMethod + 48;
-                  out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                end;}
+                  TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                end;
             end;
 
            if (counter =  39 + sessionIDLength + 2 + 1) then
@@ -1449,42 +1497,36 @@ begin
           if (ServerCertificate.PublicKey.Key.ModulusLength = 0) or // we have the key
              (ServerCertificate.PublicKey.Key.ExponentLength = 0) then
             begin
-              if UDP_debug <> 0 then
-                begin
-                  debugMsg := 'Server public key not found';
-                  out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                end;
+              debugMsg := 'Server public key not found';
+              TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
               result := 8;
               exit;
             end;
               
-          {if UDP_debug <> 0 then
             begin
               debugMsg := 'Server public key and exp:';
-              out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-              out_broadcast_local(33335, ServerCertificate.PublicKey.Key.ModulusLength, serverCertificate.PublicKey.Key.Modulus);
-              out_broadcast_local(33335, ServerCertificate.PublicKey.Key.ExponentLength, serverCertificate.PublicKey.Key.Exponent);
-            end;}
-          // success
+              TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+              TraceOut(serverCertificate.PublicKey.Key.Modulus, 
+                       serverCertificate.PublicKey.Key.ModulusLength, 
+                       6, TRACE_TYPE_LOG);
+              TraceOut(serverCertificate.PublicKey.Key.Exponent,
+                       serverCertificate.PublicKey.Key.ExponentLength,
+                       6, TRACE_TYPE_LOG);
+              TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+            end;
           result := 0;
         end
       else
         begin
-          if UDP_debug <> 0 then
-            begin
-              debugMsg := 'invalid server cert. length';
-              out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-            end;
+          debugMsg := 'invalid server cert. length';
+          TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
           result := 9;
         end;
     end
   else
     begin
-      if UDP_debug <> 0 then
-        begin
-          debugMsg := 'expected server cert.';
-          out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-        end;
+      debugMsg := 'expected server cert.';
+      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
       result := 10;
     end;
 
@@ -1495,7 +1537,7 @@ begin
            result := 12; // invalid public key modulus
            
            debugMsg := 'Invalid public key modulus';
-           out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
+           TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
 
            debugMsg[0] := Hi(ServerCertificate.PublicKey.Key.ModulusLength);
            debugMsg[1] := Lo(ServerCertificate.PublicKey.Key.ModulusLength);
@@ -1540,12 +1582,85 @@ begin
     end
   else
     begin
-      if UDP_debug <> 0 then
-        begin
-          debugMsg := 'expected Server hello done';
-          out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-        end;
+      debugMsg := 'expected Server hello done';
+      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
     end;
+end;
+
+function ProcessServerChangeCipher(startIndex: word;): byte;
+var debugMsg: array[32] of char;
+begin
+  result := 13; // server change cipher expected
+
+  // check if header exists
+  if    (host_response[startIndex] = TLS_CONTENT_CHANGE_CIPHER)
+    and (host_response[startIndex + 1] = TLS_VERSION_HIGH)
+    and (host_response[startIndex + 2] = TLS_VERSION_LO)
+  then
+    begin
+      startIndex := startIndex + 3;
+    end
+  else
+    begin
+      exit;
+    end;
+
+  if (host_response[startIndex] <> 0x00) then
+    exit;
+
+  inc(startIndex);
+  if (host_response[startIndex] <> 0x01) then
+    exit;
+
+  inc(startIndex);
+  if (host_response[startIndex] <> 0x01) then
+    exit;
+    
+  result := 0;
+end;
+
+function ProcessServerfinished(startIndex: word): byte;
+var locali, stopindex: word;
+    debugMsg: array[32] of char;
+    msgLength: word;
+    finishedMessage: array[64] of byte;
+    serverVerifyData: array[12] of byte;
+begin
+  result := 14; // server hello finished expected
+
+  msgLength := 0;
+  // check if header exists
+  if    (host_response[startIndex] = TLS_CONTENT_HANDSHAKE)
+    and (host_response[startIndex + 1] = TLS_VERSION_HIGH)
+    and (host_response[startIndex + 2] = TLS_VERSION_LO)
+  then
+    begin
+      hi(msgLength) := host_response[startIndex + 3];
+      lo(msgLength) := host_response[startIndex + 4];
+
+      if (msgLength > 64) then //todo: check if this is a limitation
+        exit; 
+      
+      startIndex := startIndex +  5;
+      stopindex  := startIndex + 64;
+    end
+  else
+    begin
+      debugMsg := 'expected Server Finished';
+      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+      exit;
+    end;
+
+  for locali := startIndex to stopIndex - 1 do
+     begin
+       finishedMessage[locali - startIndex] := host_response[locali];
+     end;
+
+  CalculateServerVerifyData(serverVerifyData);
+  AES_128_CBC_decrypt(@server_write_key, @server_write_IV, @finishedMessage, 64);
+  debugMsg := 'decrypted Server Finished';
+  TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+  TraceOut(finishedMessage, 64, 6, TRACE_TYPE_DEBUG);
 end;
 
 procedure SendAlertMessage(alertType: byte);
@@ -1575,6 +1690,8 @@ end;
 // 10 - Expected server certificate
 // 11 - Invalid TLS version from server
 // 12 - Invalid public key modulus
+// 13 - Expected server Change Cipher
+// 14 - Expected server Finished
 function Open_SSL(port : word) : boolean;
 var
     serverResponseLength: word;
@@ -1588,6 +1705,7 @@ var
 begin
   result := 1;
   certificate_len := 0;
+  Random_Init();
   if OpenTCPConnection_SSL(port) <> 0 then
     begin
       toHashMD5.firstBlock := TRUE; // start a new hash
@@ -1600,100 +1718,94 @@ begin
       if SendMessage(messageLength, TRUE) then
         begin
           Wait_With_Eth(500);
-          {if UDP_debug <> 0 then
-            begin
-              out_broadcast_local(33335, host_response_len_ssl, host_response);
-            end;}
-          
           // **  server response consists of three parts:
           //    1. Server hello
           //    2. Server certificate
           //    3. Server hello done
-          
+
           serverCertificateStartIndex := 0;
           helloDoneStartIndex := 0;
-          
+
           // 1. Server hello
             begin
               locali := 0;
               result := ProcessServerHello(locali);
             end;
-          
+
           // 2. Server certificate
           if result = 0 then
             begin
               result := ProcessServerCertificate(serverCertificateStartIndex);
             end;
-            
+
          // 3. Server hello done
           if result = 0 then
             begin
               result := ProcessServerHelloDone();
             end;
 
-          if result <> 0 then 
-            goto leaveNow;
-          
-          // prepare Client Key Exchange message
-          messageLength := CreateClientKeyExchange();
-          res := SendMessage(messageLength, false);
-          Wait_With_Eth(1000);
-          if res <> 0 then
+          if result = 0 then
             begin
-              host_response_len_ssl := 0;
-              messageLength := CreateChangeCipher();
-              res := SendMessage(6, false);
-              if res then
+              // prepare Client Key Exchange message
+              messageLength := CreateClientKeyExchange();
+              res := SendMessage(messageLength, false);
+              Wait_With_Eth(1000);
+              if res <> 0 then
                 begin
-                  Wait_With_Eth(500);
-                  {if UDP_debug <> 0 then
-                    begin
-                      debugMsg := 'Change Cipher Sent';
-                      out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                    end;}
-                  
-                  messageLength := CreateClientFinished();
-                  if SendMessage(messageLength, true) <> 0 then
+                  host_response_len_ssl := 0;
+                  messageLength := CreateChangeCipher();
+                  res := SendMessage(messageLength, false);
+                  if res <> 0 then
                     begin
                       Wait_With_Eth(500);
-                      {if UDP_debug <> 0 then
+                      debugMsg := '"Change Cipher" Sent';
+                      TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+
+                      messageLength := CreateClientFinished();
+                      res := SendMessage(messageLength, true);
+                      if res <> 0 then
                         begin
-                          debugMsg := 'client Finished SENT';
-                          out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                        end;}
+                          Wait_With_Eth(500);
+                          debugMsg := '"Client Finished" Sent';
+                          TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                        end
+                      else
+                        begin
+                          result   := 7; // client Finished not sent
+                          debugMsg := '"Client Finished" NOT Sent';
+                          TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+                        end;
                     end
                   else
                     begin
-                      result := 7; // client Finished not sent
-                      if UDP_debug <> 0 then
-                        begin
-                          debugMsg := 'client Finished NOT Sent';
-                          out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                        end;
+                      result   := 6; // client ChangeCipher not sent
+                      debugMsg := '"Change Cipher" NOT Sent';
+                      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+                    end;
+                   
+                  // expected server's "Change Cipher"
+                  if (result = 0) then
+                    begin
+                      TraceOut(host_response, host_response_len_ssl, 1, TRACE_TYPE_DEBUG);
+                      result := ProcessServerChangeCipher(0);
+                    end;
+
+                  // expected server's "Finished"
+                  if (result = 0) then
+                    begin
+                      Eth_ProcessTCP(); // take server msg if any
+                      TraceOut(host_response, host_response_len_ssl, 1, TRACE_TYPE_DEBUG);
+                      result := ProcessServerChangeCipher(0);
                     end;
                 end
               else
                 begin
-                  result := 6; // client ChangeCipher not sent
-                  if UDP_debug <> 0 then
-                    begin
-                      debugMsg := 'Change Cipher NOT Sent';
-                      out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                    end;
+                  result := 5; // clientkey exchange not sent
+                  debugMsg := '"Client Key Exchange" NOT Sent';
+                  TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
                 end;
-            end
-          else
-            begin
-              result := 5; // clientkey exchange not sent
-              if UDP_debug <> 0 then
-                  begin
-                    debugMsg := 'clientkey exchange NOT Sent';
-                    out_broadcast_local(33335, Str_Len(debugMsg), debugMsg);
-                  end;
             end;
-        end;
-
-  leaveNow:
+         end;
       if (result <> 0) then
         begin
           // send alert message
