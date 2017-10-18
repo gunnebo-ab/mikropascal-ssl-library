@@ -18,7 +18,7 @@ procedure MD5SHA(dataIn : ^char; dataLength : word; shaMd5
 procedure MD5SHAFinal(dataIn, dataOut : ^char; dataLength : word; shaMd5, contextID: byte);
 procedure HMAC_ShaMd5(secretKey : ^byte; secretKeyLength : word; textToHash : ^byte;
                       textLength : word; hmacResult : ^byte; shaMd5 : byte);
-procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
+function  AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word): byte;
 procedure AES_128_CBC_decrypt(key16, iv16, text : ^char; text_len : word);
 function  modexp(var y : array[128] of byte;
                  var e : array[128] of byte; e_len : word;
@@ -34,6 +34,7 @@ function PRF(secretKey: ^byte; secretKeyLength: word;
               prfOut: ^byte; prfLength: word): byte;
 
 procedure AddToHash(hashByte: byte; ShaMD5: byte);
+function  TLSSend(var outData: array[32] of byte; dataLength: byte): byte;
 
 type TtoHash = record
   hashed: boolean;           // indicates if dataIn is hashed
@@ -130,11 +131,13 @@ var clientRandom: array[32] of byte;
 
 var serverCipherSuite: array[2] of byte;
 var serverCompressionMethod: byte;
+var sequenceNumber: array[8] of byte;
 
 var serverCertificateStartIndex: word;
     // todo: session id goes to record parameters
     sessionIDLength: byte;
     helloDoneStartIndex: word;
+    certificateRequestIndex: word;
 
 
 procedure Random_Init;
@@ -169,6 +172,47 @@ begin
   Random_Init();
   m_r := Random;
   while ((Lo(m_r) = 0) or (Hi(m_r) = 0) or (Higher(m_r) = 0) or (Highest(m_r) = 0)) do m_r := Random;
+end;
+
+// big endian 8-byte variable
+procedure IncrementSequenceNumber();
+begin
+  inc(sequenceNumber[7]);
+  if (sequenceNumber[7] = 0) then
+    begin
+      inc(sequenceNumber[6]);
+      if (sequenceNumber[6] = 0) then
+        begin
+          inc(sequenceNumber[5]);
+          if (sequenceNumber[5] = 0) then
+            begin
+              inc(sequenceNumber[4]);
+              if (sequenceNumber[4] = 0) then
+                begin
+                  inc(sequenceNumber[3]);
+                  if (sequenceNumber[3] = 0) then
+                    begin
+                      inc(sequenceNumber[2]);
+                      if (sequenceNumber[2] = 0) then
+                        begin
+                          inc(sequenceNumber[1]);
+                          if (sequenceNumber[1] = 0) then
+                            begin
+                              inc(sequenceNumber[0]);
+                            end;
+                        end;
+                    end;
+                end;
+            end;
+        end;
+    end;
+end;
+
+procedure ClearSequenceNumber();
+var i: byte;
+begin
+  for i := 0 to 7 do
+    sequenceNumber[i] := 0;
 end;
 
 // number of bytes must be divisible by 4
@@ -517,9 +561,10 @@ begin
   MD5SHAFinal(@isha, hmacResult, digestSize, shaMd5, restoreContext);
 end;
 
-procedure AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word);
+function AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word): byte;
 var blocks,i,buf : word;
 begin
+  result := 1; // prepare for errors
   if (text_len mod 16) = 0 then 
     nop 
   else 
@@ -560,9 +605,10 @@ begin
       dma_read(0x7C20, text + i*16, 16);
       inc(i);
   end;
+  result := 0; // no errors
 end;
 
-procedure AES_128_CBC_decrypt(key16,iv16,text : ^char; text_len : word);
+procedure AES_128_CBC_decrypt(key16, iv16, text : ^char; text_len : word);
 var blocks,i,buf : word;
 begin
   if (text_len mod 16) = 0 then nop else exit;
@@ -928,8 +974,8 @@ begin
             i := Str_Len(msg);
             msg[i]     := Hi(ServerCertificate.PublicKey.Key.ExponentLength);
             msg[i + 1] := Lo(ServerCertificate.PublicKey.Key.ExponentLength);
-            msg[i + 3] := Hi(ServerCertificate.PublicKey.Key.ModulusLength);
-            msg[i + 4] := Lo(ServerCertificate.PublicKey.Key.ModulusLength);
+            msg[i + 2] := Hi(ServerCertificate.PublicKey.Key.ModulusLength);
+            msg[i + 3] := Lo(ServerCertificate.PublicKey.Key.ModulusLength);
             TraceOut(msg, i + 4, 1, TRACE_TYPE_DEBUG);
           end;
       
@@ -961,6 +1007,8 @@ begin
       HTTP_data_out[2] := TLS_VERSION_LO;
       HTTP_data_out[3] := 0x00;
       HTTP_data_out[4] := 0x86;
+      
+      
 
       HTTP_data_out[5]  := TLS_HANDSHAKE_CLIENT_KEY_EXCHANGE;     // ClientKeyExchange message type, 0x10
       HTTP_data_out[6]  := $00;     // Message length Higher
@@ -976,7 +1024,7 @@ begin
            HTTP_data_out[11 + i] := rsaCipherText[i];
          end;
       
-      result := 139;
+      result := 139 ;
 end;
 
 function CreateClientHello: word; // returns number of bytes
@@ -1023,6 +1071,42 @@ begin
       
       result := 52;
 end;
+
+function CreateClientCertificate: word; // returns number of bytes
+var i: byte;
+begin
+{
+  This message is only sent if the
+      server requests a certificate.  If no suitable certificate is
+      available, the client SHOULD send a certificate message containing
+      no certificates.  That is, the certificate_list structure has a
+      length of zero.
+}
+
+    // build a "Client Certificate" message
+    Mem_Set(@HTTP_data_out, 0, 256);
+
+    // 1. TLS record header
+    HTTP_data_out[0] := TLS_CONTENT_HANDSHAKE; // handshake type
+    HTTP_data_out[1] := TLS_VERSION_HIGH;
+    HTTP_data_out[2] := TLS_VERSION_LO;
+    HTTP_data_out[3] := $00;     // content length HiByte
+    HTTP_data_out[4] := $07;     // content length LoByte => 4 B in total after this point
+
+    // 2. Handshake header, hashing starts here
+    HTTP_data_out[5] := TLS_HANDSHAKE_CERTIFICATE;
+    HTTP_data_out[6] := $00;     // length
+    HTTP_data_out[7] := $00;     // length
+    HTTP_data_out[8] := $03;     // length = 3 bytes from this point onwards
+    HTTP_data_out[9] := $00;     // length
+    HTTP_data_out[10] := $00;     // length
+    HTTP_data_out[11] := $00;     // length = 0 bytes from this point onwards
+ 
+    // 3. client certificates starts here, if any
+
+    result := 12;
+end;
+
 
 function CreateChangeCipher: word; // returns number of bytes
 begin
@@ -1215,7 +1299,7 @@ begin
       
       // 1. calculate HMAC on associated data + verify data
       Mem_Set(@toEncrypt, 0, 48);
-      // associated data
+      // associated data // current sequence number, 8 x 0x00
       for i := 0 to 7 do
         toEncrypt[i] := 0;
       
@@ -1313,8 +1397,20 @@ begin
        Higher(serverHelloLength) := host_response[startIndex + 1];
        Hi(serverHelloLength) := host_response[startIndex + 2];
        lo(serverHelloLength) := host_response[startIndex + 3];
+
        serverHelloLength := serverHelloLength + 4; // include server hello id, plus 3 bytes for length
        stopIndex  := startIndex + serverHelloLength - 1;
+
+//       uart3_write_text(' /hashing from ');
+//       Word2str(startIndex * 2, debugMsg);
+//       uart3_write_text(debugMsg);
+//
+//       uart3_write_text(' to ');
+//       Word2str(stopIndex * 2, debugMsg);
+//       uart3_write_text(debugMsg);
+//
+//       uart3_write_text('/ ');
+
        counter    := 0;
        for locali := startIndex to stopIndex do
          begin
@@ -1442,9 +1538,11 @@ begin
    then
     begin
       locali := locali + 5; // skip header
+//      uart3_write_text(' skipping header ');
     end
   else
     begin
+//      uart3_write_text(' no header ');
     end;
 
   if (host_response[locali] = TLS_HANDSHAKE_CERTIFICATE) then // server certificate 0x0b
@@ -1454,55 +1552,130 @@ begin
       Hi(serverCertificateLength) := host_response[locali + 2];
       Lo(serverCertificateLength) := host_response[locali + 3];
 
-      serverCertificateLength := serverCertificateLength + 4; // certificate id + 3 bytes for length
+//      uart3_write_text(' serverCertificateLength ');
+//      Word2Hex(serverCertificateLength, debugMsg);
+//      uart3_write_text(debugMsg);
       
-      // hello done starts after certificate stop index
-      helloDoneStartIndex := locali + serverCertificateLength;
+
+      serverCertificateLength := serverCertificateLength + 4; // certificate id + 3 bytes for length
       
       // extract certificates
       startIndex := locali;
       stopIndex  := startIndex + word(serverCertificateLength) - 1;
+
+//       uart3_write_text(' /hashing from ');
+//       Word2str(startIndex * 2, debugMsg);
+//       uart3_write_text(debugMsg);
+
+//       uart3_write_text(' to ');
+//       Word2str(stopIndex * 2, debugMsg);
+//       uart3_write_text(debugMsg);
+//
+//       uart3_write_text('/ ');
+
       for locali := startIndex to stopIndex do
         begin
           // todo: keep the certificate somewhere, then compare it with trusted, for security
-          ClrWDT();
           AddToHash(host_response[locali], 0); // SHA-1
           AddToHash(host_response[locali], 1); // MD5
         end;
-      
-      // move to the first cert. assuming it starts with 0x30
-      locali := startIndex;
-      while host_response[locali] <> 0x30 do
+//      uart3_write_text(' hashing done at: ');
+//      byte2Hex(stopIndex, debugMsg);
+//      uart3_write_text(debugMsg);
+
+
+      //** todo: pull this block out of this function
+      if    (host_response[stopIndex + 1] = TLS_CONTENT_HANDSHAKE)
+        and (host_response[stopIndex + 2] = TLS_VERSION_HIGH)
+        and (host_response[stopIndex + 3] = TLS_VERSION_LO)
+        and (host_response[stopIndex + 6] = TLS_HANDSHAKE_CERTIFICATE_REQUEST)
+       then
         begin
+          certificateRequestIndex := stopIndex + 1;
+        end
+      else if    (host_response[stopIndex + 1] = TLS_HANDSHAKE_CERTIFICATE_REQUEST) then
+        begin
+          certificateRequestIndex := stopIndex + 1;
+        end;
+
+      if    (host_response[stopIndex + 1] = TLS_CONTENT_HANDSHAKE)
+        and (host_response[stopIndex + 2] = TLS_VERSION_HIGH)
+        and (host_response[stopIndex + 3] = TLS_VERSION_LO)
+        and (host_response[stopIndex + 6] = TLS_HANDSHAKE_SERVER_HELLO_DONE)
+       then
+        begin
+          helloDoneStartIndex := stopIndex + 1;
+        end
+      else if    (host_response[stopIndex + 1] = TLS_HANDSHAKE_SERVER_HELLO_DONE) then
+        begin
+          helloDoneStartIndex := stopIndex + 1;
+        end;
+      //~
+
+      // move to the first cert. assuming it starts with 0x3082
+      locali := startIndex;
+//      while ((host_response[locali] <> 0x30) and
+//             (host_response[locali + 1] <> 0x82)) do
+      while true do
+        begin
+          if ((host_response[locali] = 0x30) and
+              (host_response[locali + 1] = 0x82)) then
+            begin
+              break;
+            end;
           inc(locali);
           if locali >= serverCertificateLength then
-            break;
+            begin
+//              uart3_write_text(' emergency out ');
+              break;
+            end;
         end;
       startIndex := locali;
-        
+      
+//      uart3_write_text(' start cert at ');
+//      Word2Hex(startIndex, debugMsg);
+//      uart3_write_text(debugMsg);
+      
+//      uart3_write_text(' serverCertificateLength ');
+//      Word2Hex(serverCertificateLength, debugMsg);
+//      uart3_write_text(debugMsg);
+
       X509Init(host_response, serverCertificateLength);
       if startIndex < serverCertificateLength then
         begin
-          while startIndex < serverCertificateLength do
+//          uart3_write_text(' here 1 ');
+          while (word(startIndex) < word(serverCertificateLength)) do
             begin
               parsedBytes := DecodeCertificate(host_response, ServerCertificate, startIndex);
-              startindex := startindex + parsedBytes;
+              if parsedBytes = 0 then
                 begin
-                  if ServerCertificate.PublicKey.Key.ModulusLength > 0 then // we have the key
-                    if ServerCertificate.PublicKey.Key.ExponentLength > 0 then // we have the key
-                      break;
+//                  uart3_write_text(' nothing parsed at ');
+//                  Word2Hex(startIndex, debugMsg);
+//                  uart3_write_text(debugMsg);
+                  
+                  break;
                 end;
+              startindex := startindex + parsedBytes;
+      //        uart3_write_text(' here 2 ');
+              if ServerCertificate.PublicKey.Key.ModulusLength > 0 then // we have the key
+                begin
+                  if ServerCertificate.PublicKey.Key.ExponentLength > 0 then // we have the key
+                    break;
+                end;
+
+          //    uart3_write_text(' here 3 ');
             end;
               
-          if (ServerCertificate.PublicKey.Key.ModulusLength = 0) or // we have the key
+         // uart3_write_text(' here 4 ');
+          if (ServerCertificate.PublicKey.Key.ModulusLength = 0) or
              (ServerCertificate.PublicKey.Key.ExponentLength = 0) then
             begin
               debugMsg := 'Server public key not found';
               TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
               result := 8;
               exit;
-            end;
-              
+            end
+          else
             begin
               debugMsg := 'Server public key and exp:';
               TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
@@ -1512,9 +1685,8 @@ begin
               TraceOut(serverCertificate.PublicKey.Key.Exponent,
                        serverCertificate.PublicKey.Key.ExponentLength,
                        6, TRACE_TYPE_LOG);
-              TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+              result := 0
             end;
-          result := 0;
         end
       else
         begin
@@ -1546,6 +1718,80 @@ begin
     end;
 end;
 
+function ProcessServerCertificateRequest(): byte;
+var requestLength: dword;
+    locali, startIndex, stopIndex: word;
+    debugMsg: string[32];
+begin
+  result := 15; // invalid request
+  
+//  uart3_write_text(' certificateRequestIndex ');
+//  Word2Hex(certificateRequestIndex, debugMsg);
+//  uart3_write_text(debugMsg);
+  
+ // server can send the header again
+  if    (host_response[certificateRequestIndex] = TLS_CONTENT_HANDSHAKE)
+    and (host_response[certificateRequestIndex + 1] = TLS_VERSION_HIGH)
+    and (host_response[certificateRequestIndex + 2] = TLS_VERSION_LO)
+   then
+    begin
+      certificateRequestIndex := certificateRequestIndex + 5; // skip header
+    end
+  else
+    begin
+    end;
+  
+  if (host_response[certificateRequestIndex] <> TLS_HANDSHAKE_CERTIFICATE_REQUEST) then
+    exit;
+
+  higher(requestLength) := host_response[certificateRequestIndex + 1];
+      hi(requestLength) := host_response[certificateRequestIndex + 2];
+      lo(requestLength) := host_response[certificateRequestIndex + 3];
+
+//  uart3_write_text(' certificateRequestStartIndex: ');
+//  Word2Hex(certificateRequestIndex, debugMsg);
+//  uart3_write_text(debugMsg);
+
+  startIndex := certificateRequestIndex;
+  stopIndex  := startindex + requestLength + 4 - 1; // todo: check out of 16bit bounds
+  
+//  uart3_write_text(' certificateRequeststopIndex: ');
+//  Word2Hex(stopIndex, debugMsg);
+//  uart3_write_text(debugMsg);
+
+//  uart3_write_text(' /hashing from ');
+//  Word2str(startIndex * 2, debugMsg);
+//  uart3_write_text(debugMsg);
+
+//  uart3_write_text(' to ');
+//  Word2str(stopIndex * 2, debugMsg);
+//  uart3_write_text(debugMsg);
+//
+//  uart3_write_text('/ ');
+  
+  for locali := startIndex to stopIndex do
+    begin
+      // hash
+      AddToHash(host_response[locali], 0); // SHA-1
+      AddToHash(host_response[locali], 1); // MD5
+    end;
+
+  // here we expect hello done, let's check
+  if (helloDoneStartIndex <> stopIndex + 1) then
+    begin
+      // todo: throw error/warning
+//      UART3_Write_Text(' W: changing hello done ');
+//      Word2Hex(helloDoneStartIndex, debugMsg);
+//      uart3_write_text(debugMsg);
+      
+      helloDoneStartIndex := stopIndex + 1;
+      
+//      Word2Hex(helloDoneStartIndex, debugMsg);
+//      uart3_write_text(debugMsg);
+    end;
+  result := 0;
+end;
+
 function ProcessServerHelloDone(): byte;
 var locali, startindex, stopindex: word;
     debugMsg: array[32] of char;
@@ -1554,6 +1800,10 @@ begin
 
   if helloDoneStartIndex = 0 then
     exit;
+   
+//  uart3_write_text(' helloDoneStartIndex: ');
+//  Word2Hex(helloDoneStartIndex, debugMsg);
+//  uart3_write_text(debugMsg);
     
   // check if header exists
   if    (host_response[helloDoneStartIndex] = TLS_CONTENT_HANDSHAKE)
@@ -1571,6 +1821,17 @@ begin
     begin
       startIndex := helloDoneStartIndex;
       stopIndex  := helloDoneStartIndex + 4 - 1; // 4 bytes in hello done
+      
+//       uart3_write_text(' /hashing from ');
+//       Word2str(startIndex * 2, debugMsg);
+//       uart3_write_text(debugMsg);
+//
+//       uart3_write_text(' to ');
+//       Word2str(stopIndex * 2, debugMsg);
+//       uart3_write_text(debugMsg);
+//
+//       uart3_write_text('/ ');
+      
       for locali := startIndex to stopIndex do
          begin
            // hash
@@ -1584,10 +1845,16 @@ begin
     begin
       debugMsg := 'expected Server hello done';
       TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+      debugMsg[0] := host_response[helloDoneStartIndex - 1];
+      debugMsg[1] := host_response[helloDoneStartIndex + 0];
+      debugMsg[2] := host_response[helloDoneStartIndex + 1];
+      debugMsg[3] := host_response[helloDoneStartIndex + 2];
+      debugMsg[4] := host_response[helloDoneStartIndex + 3];
+      TraceOut(debugMsg, 5, 1, TRACE_TYPE_ERROR);
     end;
 end;
 
-function ProcessServerChangeCipher(startIndex: word;): byte;
+function ProcessServerChangeCipher(var startIndex: word): byte;
 var debugMsg: array[32] of char;
 begin
   result := 13; // server change cipher expected
@@ -1615,18 +1882,21 @@ begin
   inc(startIndex);
   if (host_response[startIndex] <> 0x01) then
     exit;
-    
+  
+  ClearSequenceNumber();
+  
   result := 0;
 end;
 
-function ProcessServerfinished(startIndex: word): byte;
+function ProcessServerFinished(startIndex: word): byte;
 var locali, stopindex: word;
     debugMsg: array[32] of char;
     msgLength: word;
+    i: byte;
     finishedMessage: array[64] of byte;
     serverVerifyData: array[12] of byte;
 begin
-  result := 14; // server hello finished expected
+  result := 14; // server finished expected
 
   msgLength := 0;
   // check if header exists
@@ -1656,11 +1926,22 @@ begin
        finishedMessage[locali - startIndex] := host_response[locali];
      end;
 
-  CalculateServerVerifyData(serverVerifyData);
-  AES_128_CBC_decrypt(@server_write_key, @server_write_IV, @finishedMessage, 64);
-  debugMsg := 'decrypted Server Finished';
-  TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
-  TraceOut(finishedMessage, 64, 6, TRACE_TYPE_DEBUG);
+  result := CalculateServerVerifyData(serverVerifyData);
+  if (result <> 0) then
+    begin
+      result := 16;  // failed to calculate server finished
+      debugMsg := 'Failed server verify';
+      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_LOG);
+    end
+  else
+    begin
+      AES_128_CBC_decrypt(@server_write_key, @server_write_IV, @finishedMessage, 64);
+      debugMsg := 'decrypted Server Finished';
+      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_LOG);
+      TraceOut(finishedMessage, 64, 6, TRACE_TYPE_DEBUG);
+      TraceOut(serverVerifyData, 12, 6, TRACE_TYPE_DEBUG);
+      result := 0;
+    end;
 end;
 
 procedure SendAlertMessage(alertType: byte);
@@ -1692,6 +1973,8 @@ end;
 // 12 - Invalid public key modulus
 // 13 - Expected server Change Cipher
 // 14 - Expected server Finished
+// 15 - Invalid server certificate request
+// 16 - Client Certificate not sent
 function Open_SSL(port : word) : boolean;
 var
     serverResponseLength: word;
@@ -1701,11 +1984,12 @@ var
     messageLength: word;
     debugMsg: string[32];
     res: byte;
-    label leaveNow;
+    sendCertificate: byte;
 begin
   result := 1;
   certificate_len := 0;
   Random_Init();
+  ClearSequenceNumber();
   if OpenTCPConnection_SSL(port) <> 0 then
     begin
       toHashMD5.firstBlock := TRUE; // start a new hash
@@ -1718,13 +2002,16 @@ begin
       if SendMessage(messageLength, TRUE) then
         begin
           Wait_With_Eth(500);
+          TraceOut(host_response, host_response_len_ssl, 1, TRACE_TYPE_DEBUG);
+          
           // **  server response consists of three parts:
           //    1. Server hello
           //    2. Server certificate
           //    3. Server hello done
 
           serverCertificateStartIndex := 0;
-          helloDoneStartIndex := 0;
+          helloDoneStartIndex         := 0;
+          certificateRequestIndex     := 0;
 
           // 1. Server hello
             begin
@@ -1732,10 +2019,23 @@ begin
               result := ProcessServerHello(locali);
             end;
 
+//          UART3_Write_Text(' Starting cert ');
+          
           // 2. Server certificate
           if result = 0 then
             begin
               result := ProcessServerCertificate(serverCertificateStartIndex);
+            end;
+
+//          UART3_Write_Text(' Ended cert ');
+
+         // 2a. If exists, ServerCertificateRequest
+         if (result = 0) then
+            begin
+              if (certificateRequestIndex > 0) then
+                begin
+                  result := ProcessServerCertificateRequest();
+                end;
             end;
 
          // 3. Server hello done
@@ -1743,21 +2043,54 @@ begin
             begin
               result := ProcessServerHelloDone();
             end;
-
+            
+            
+         // 4. if server requested certificate, now it should be sent
+         if (certificateRequestIndex <> 0) then
+            begin
+              messageLength := CreateClientCertificate();
+              res := SendMessage(messageLength, false);
+              if res <> 0 then
+                begin
+                  debugMsg := '"Client Certificate" Sent';
+                  TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                  result := 0;
+                end
+              else
+                begin
+                  result   := 16; // client Certificate not sent
+                  debugMsg := '"Client Certificate" NOT Sent';
+                  TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+                end;
+            end;
+            
+          Wait_With_Eth(500);
           if result = 0 then
             begin
               // prepare Client Key Exchange message
               messageLength := CreateClientKeyExchange();
               res := SendMessage(messageLength, false);
-              Wait_With_Eth(1000);
+              
+              if res <> 0 then
+                begin
+                  debugMsg := '"Client Key Exchange" Sent';
+                  TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
+                end
+              else
+                begin
+                  debugMsg := '"Client Key Exchange" NOT Sent';
+                  TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+                end;
+              
+              Wait_With_Eth(1500);
               if res <> 0 then
                 begin
                   host_response_len_ssl := 0;
                   messageLength := CreateChangeCipher();
                   res := SendMessage(messageLength, false);
+                  Wait_With_Eth(500);
                   if res <> 0 then
                     begin
-                      Wait_With_Eth(500);
                       debugMsg := '"Change Cipher" Sent';
                       TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
 
@@ -1765,7 +2098,7 @@ begin
                       res := SendMessage(messageLength, true);
                       if res <> 0 then
                         begin
-                          Wait_With_Eth(500);
+                          IncrementSequenceNumber();
                           debugMsg := '"Client Finished" Sent';
                           TraceOut(debugMsg, Str_Len(debugMsg), 6, TRACE_TYPE_LOG);
                         end
@@ -1787,15 +2120,27 @@ begin
                   if (result = 0) then
                     begin
                       TraceOut(host_response, host_response_len_ssl, 1, TRACE_TYPE_DEBUG);
-                      result := ProcessServerChangeCipher(0);
+                      locali := 0;
+                      result := ProcessServerChangeCipher(locali);
+                      // locali now points to end of change cipher
+                      locali := locali + 1; // move to finished, if any
                     end;
 
                   // expected server's "Finished"
                   if (result = 0) then
                     begin
-                      Eth_ProcessTCP(); // take server msg if any
-                      TraceOut(host_response, host_response_len_ssl, 1, TRACE_TYPE_DEBUG);
-                      result := ProcessServerChangeCipher(0);
+                      Wait_With_Eth(500);
+                      debugMsg := 'Expecting "Finished"';
+                      TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+                      result := ProcessServerFinished(locali);
+                      if result <> 0 then // try to get it again
+                        begin
+                          host_response_len_ssl := 0; // expect a new message
+                          Eth_ProcessTCP(); // take server msg if any
+                          TraceOut(host_response, host_response_len_ssl, 1, TRACE_TYPE_DEBUG);
+                          locali := 0;
+                          result := ProcessServerFinished(locali);
+                        end;
                     end;
                 end
               else
@@ -1808,6 +2153,8 @@ begin
          end;
       if (result <> 0) then
         begin
+          debugMsg := 'Handshake ended with errors';
+          TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
           // send alert message
           SendAlertMessage(TLS_ALERT_HANDSHAKE_FAILURE);
         end;
@@ -1977,6 +2324,129 @@ begin
       PRFOut^ := PRFOut^ xor sha1Out[i];
       inc(PRFOut);
     end;
+end;
+
+//todo: refactor TLSSend. It is already used in ClientFinished
+function TLSSend(var outData: array[32] of byte; dataLength: byte): byte;
+var i, limit, paddingByte: byte;
+    messageHMAC: array[20] of byte;
+    toEncrypt: array[128] of byte;
+    debugMsg: string[32];
+{
+  Sequence number is never transmitted, encrypted or otherwise;
+  it’s just prepended to the MAC buffer before the packet is MAC’ed. Therefore,
+  given a content buffer of “content”, the buffer that is MAC’ed looks like this:
+ 
+  buffer = <SeqNumber:8><MessageType:1><Version:2><ContentLength:2><Content:Variable>
+  
+  Digest is calculated over the buffer
+  digest = MAC(buffer) = SHA1(Buffer) - 20 bytes
+  
+  prepared = <MessageType:1><Version:2><ContentLen+MacLen+PaddingLen:2><Content:Variable><digest:20>
+  
+  encrypted = ENCRYPT(prepared)
+  
+  toSend = <MessageType:1 = 0x17><Version:2><Length:2 = 0x0080><encrypted:128>
+  
+  MessageType 0x17 = Content Application Data
+}
+begin
+   // prepare data
+
+ // the Plan:
+      //   1. calculate HMAC on associated data + outData
+      //   2. Pad HMAC and verify data
+      //   3. CBC encrypt padded message using client IV
+      //   4. pack the message
+
+      // 1. calculate HMAC on associated data + outData
+      Mem_Set(@toEncrypt, 0, 128);
+      // associated data // current sequence number, 8 bytes
+      for i := 0 to 7 do
+        toEncrypt[i] := sequenceNumber[i];
+      toEncrypt[7] := 1; // todo: remove it
+        
+      // TLS record header
+      toEncrypt[8]  := TLS_CONTENT_APPLICATION_DATA;
+      toEncrypt[9]  := TLS_VERSION_HIGH;
+      toEncrypt[10] := TLS_VERSION_LO;
+      toEncrypt[11] := $00;     // Message length Hi
+      toEncrypt[12] := dataLength;     // Record  length //todo: take high too
+
+      for i := 0 to dataLength - 1 do
+        begin
+          toEncrypt[i + 13] := outData[i];
+        end;
+
+      // calculate HMAC SHA-1 of the message
+      HMAC_ShaMd5(@client_write_MAC_secret,  // Secret
+                  20,             // Secret length
+                  @toEncrypt,     // Data to hash
+                  dataLength + 13,// Data length
+                  @messageHMAC ,  // Hash result
+                  0);             // SHA-1
+                  
+                  
+      //2. concat outData and HMAC
+      Mem_Set(@toEncrypt, 0, 128);
+
+      // copy outData
+      for i := 0 to dataLength - 1 do
+        toEncrypt[i] := outData[i];
+
+      // copy HMAC
+      for i := 0 to 19 do
+        toEncrypt[dataLength + i] := messageHMAC[i];
+
+      // calculate number of padding bytes and their value
+      i := 20 + dataLength;
+      paddingByte := 0;
+      while (i mod 16) <> 0 do
+        begin
+          inc(i);
+          inc(paddingByte);
+        end;
+      limit := i;
+      for i := dataLength + 20 to limit - 1 do
+        toEncrypt[i] := paddingByte - 1; // for ex. if there are 5 bytes needed, all of them would have the value of 0x04
+
+      //3. CBC encrypt
+      result := AES_128_CBC_encrypt(@client_write_key, @client_write_IV, @toEncrypt, limit);
+      if (result <> 0) then
+        begin
+          debugMsg := 'Encryption failed';
+          TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+          TraceOut(toEncrypt, limit, 1, TRACE_TYPE_ERROR);
+        end
+      else
+        begin
+            // 4. pack the message
+            HTTP_data_out[0] := TLS_CONTENT_APPLICATION_DATA;
+            HTTP_data_out[1] := TLS_VERSION_HIGH;
+            HTTP_data_out[2] := TLS_VERSION_LO;
+            HTTP_data_out[3] := $00;            // Message length Hi
+            HTTP_data_out[4] := 16 + limit;     // Record  length Lo// todo: check hi byte
+
+            // append client IV
+            for i := 0 to 15 do
+              HTTP_data_out[5 + i] := client_write_IV[i];
+
+            for i := 0 to limit - 1 do
+              HTTP_data_out[21 + i] := toEncrypt[i];
+
+            result := 16 + limit + 5;
+
+            result := SendMessage(result, true);
+            if result <> 0 then
+              begin
+                IncrementSequenceNumber();
+                result := 0 // no errors
+              end
+            else
+              begin
+                result := 1; // message not sent
+              end;
+        end;
 end;
 
 end.
