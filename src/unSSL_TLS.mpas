@@ -2,7 +2,7 @@ unit unSSL_TLS;
 
 uses dspic_additional_string_library,lib_Delays_LIO,def_io,lib1_enc600_V3_5_b,
      enc_lib_user,lib2_enc600_V3_5_b,df_lib_SPI1,crc16_lib,
-     Tftp_Server,config,HTTP_Send,definitions_ENC600,unX509Certificate;
+     Tftp_Server,HTTP_Send,definitions_ENC600,unX509Certificate;
 
 procedure Random_Init;
 procedure Random_Array_32(d_in : ^byte);
@@ -26,16 +26,17 @@ function  modexp(var y : array[128] of byte;
                  var m : array[128] of byte; m_len : word): byte;
 procedure SSL_Init;
 procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
-function OpenTCPConnection_SSL(port : word) : boolean;
-function Open_SSL(port : word) : boolean;
-function PRF(secretKey: ^byte; secretKeyLength: word;
+function  OpenTCPConnection_SSL(port : word) : boolean;
+function  Open_SSL(port : word) : boolean;
+function  PRF(secretKey: ^byte; secretKeyLength: word;
               aLabel: ^byte; labelLength: word;
               seed: ^byte; seedLength: word;
               prfOut: ^byte; prfLength: word): byte;
 
 procedure AddToHash(hashByte: byte; ShaMD5: byte);
-function  TLSSend(var outData: array[128] of byte; dataLength: byte): byte;
-function TLSReceive(var dataLength: word): byte;
+function  TLSSend128(var outData: array[1024] of byte; dataLength: word): byte;
+function  TLSSend(var outData: array[1024] of byte; dataLength: word): byte;
+function  TLSReceive(var dataLength: word): byte;
 
 type TtoHash = record
   hashed: boolean;           // indicates if dataIn is hashed
@@ -51,7 +52,8 @@ Type TTlsConnection = record
     serverCipherSuite: array[2] of byte;
     serverCompressionMethod: byte;
   end;
-
+  
+// a globally visible variable
 var tlsConnection: TTlsConnection;
 
 const TLS_CONNECTION_STATE_DISCONNECTED = 0;
@@ -573,7 +575,7 @@ end;
 
 // returns number of errors
 function AES_128_CBC_encrypt(key16, iv16, text : ^char; text_len : word): byte;
-var blocks,i,buf : word;
+var blocks, i, buf : word;
 begin
   result := 1; // prepare for errors
   if (text_len mod 16) = 0 then 
@@ -784,12 +786,12 @@ end;
 // the values are OR-ed together to make combinations
 procedure TraceOut(var debugData: array[4096] of byte; debugDataLength: word; traceLevel, traceType: byte);
 begin
-  if (udpDebugLevel >= traceLevel) then
+  if (flashData.debugLevel >= traceLevel) then
     begin
       {UART3_Write(udpDebugLevel);
       UART3_Write(traceLevel);
       UART3_Write(udpTraceType);}
-    if ((traceType and udpTraceType) = traceType) then
+    if ((traceType and flashData.debugType) = traceType) then
       begin
         out_broadcast_local(33335, debugDataLength, debugData);
       end;
@@ -797,10 +799,27 @@ begin
 end;
 
 procedure SSL_Init;
+var locali: word;
 begin
   HTTP_send_Port_ssl := TMR1 + 23456;
-  certificate_len := 0;
   host_response_len_ssl := 0;
+  tlsConnection.connectionState := TLS_CONNECTION_STATE_DISCONNECTED;
+  tlsConnection.toHashMD5.firstBlock := TRUE; // start a new hash
+  tlsConnection.toHashMD5.dataLength := 0;
+
+  tlsConnection.toHashSHA1.firstBlock := TRUE; // start a new hash
+  tlsConnection.toHashSHA1.dataLength := 0;
+  tlsConnection.ServerCertificate.PublicKey.Key.Exponent[0] := 0;
+  tlsConnection.ServerCertificate.PublicKey.Key.Exponent[1] := 0;
+  tlsConnection.ServerCertificate.PublicKey.Key.Exponent[2] := 0;
+  tlsConnection.ServerCertificate.PublicKey.Key.Exponent[3] := 0;
+  tlsConnection.ServerCertificate.PublicKey.Key.ModulusLength  := 0;
+  tlsConnection.ServerCertificate.PublicKey.Key.ExponentLength := 0;
+  for locali := 0 to 511 do
+    tlsConnection.ServerCertificate.PublicKey.Key.Modulus[locali] := 0;
+  
+  Random_Init();
+  ClearSequenceNumber();
 end;
 
 procedure HTTPProcDataIn_SSL(len_ : word; j : byte);
@@ -813,7 +832,7 @@ begin
 
   if host_response_len_ssl >= 6144 {4096} then
     begin
-      UART3_Write_Text('Rx message too long');
+//      UART3_Write_Text('Rx message too long');
       exit;
     end;
 
@@ -844,17 +863,17 @@ again_:
   Wait_With_Eth(100);
 
   result := false;
-  if Str_Len(server_address_url) < 3 then exit;
+  if Str_Len(flashData.mqttBrokerServer) < 3 then exit;
 
-  if IsIP(server_address_url) <> 0 then
+  if IsIP(flashData.mqttBrokerServer) <> 0 then
     begin
-      Str2IP(server_address_url,server_addr);
+      Str2IP(flashData.mqttBrokerServer, server_addr);
     end
   else
     begin
-      if Dns_Resolve(server_address_url,server_addr) = false then
+      if Dns_Resolve(flashData.mqttBrokerServer, server_addr) = false then
         begin
-          if Dns_Resolve(server_address_url,server_addr) = false then
+          if Dns_Resolve(flashData.mqttBrokerServer, server_addr) = false then
             begin
               Socket_TCP_buf := 'DNS fail';
               TraceOut(Socket_TCP_buf, Str_Len(Socket_TCP_buf), 1, TRACE_TYPE_ERROR);
@@ -880,9 +899,10 @@ again_:
 
   TCP_Close_Port(HTTP_send_Port_ssl);
 
-  HTTP_send_Port_ssl := HTTP_send_Port_ssl + 1;
-
-  if HTTP_send_Port_ssl > 65000 then HTTP_send_Port_ssl := TMR1 + 23456;
+//  HTTP_send_Port_ssl := HTTP_send_Port_ssl + 1;
+//
+//  if HTTP_send_Port_ssl > 65000 then
+    HTTP_send_Port_ssl := TMR1 + 23456;
 
   TCP_Open_Port(HTTP_send_Port_ssl);
 
@@ -910,7 +930,7 @@ end;
 function SendMessage(messageLength: word; waitForResponse: byte) : byte;
 var startAddress, stopAddress: word;
     msg: array[32] of char;
-    i: byte;
+    i: word;
 begin
   Wait_With_Eth(100);
   result := 0; // no errors
@@ -924,7 +944,9 @@ begin
       exit;
     end;
 
-    TraceOut(HTTP_data_out, messageLength, 3, TRACE_TYPE_LOG);
+  msg := 'Sending';
+  TraceOut(msg, str_len(msg), 1, TRACE_TYPE_LOG);
+  TraceOut(HTTP_data_out, messageLength, 3, TRACE_TYPE_LOG);
 
   // hash outgoing handshake messages, without headers
   if HTTP_data_out[0] = TLS_CONTENT_HANDSHAKE then
@@ -1719,30 +1741,21 @@ begin
       X509Init(host_response, serverCertificateLength);
       if startIndex < serverCertificateLength then
         begin
-//          uart3_write_text(' here 1 ');
           while (word(startIndex) < word(serverCertificateLength)) do
             begin
               parsedBytes := DecodeCertificate(host_response, tlsConnection.ServerCertificate, startIndex);
               if parsedBytes = 0 then
                 begin
-//                  uart3_write_text(' nothing parsed at ');
-//                  Word2Hex(startIndex, debugMsg);
-//                  uart3_write_text(debugMsg);
-                  
                   break;
                 end;
               startindex := startindex + parsedBytes;
-      //        uart3_write_text(' here 2 ');
               if tlsConnection.ServerCertificate.PublicKey.Key.ModulusLength > 0 then // we have the key
                 begin
                   if tlsConnection.ServerCertificate.PublicKey.Key.ExponentLength > 0 then // we have the key
                     break;
                 end;
-
-          //    uart3_write_text(' here 3 ');
             end;
               
-         // uart3_write_text(' here 4 ');
           if (tlsConnection.ServerCertificate.PublicKey.Key.ModulusLength = 0) or
              (tlsConnection.ServerCertificate.PublicKey.Key.ExponentLength = 0) then
             begin
@@ -2062,7 +2075,6 @@ var
     sendCertificate: byte;
 begin
   result := 1;
-  certificate_len := 0;
   tlsConnection.connectionState := TLS_CONNECTION_STATE_DISCONNECTED;
   Random_Init();
   ClearSequenceNumber();
@@ -2236,6 +2248,7 @@ begin
          end;
       if (result <> 0) then
         begin
+          tlsConnection.connectionState := TLS_CONNECTION_STATE_DISCONNECTED;
           debugMsg := 'Handshake ended with errors';
           TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
           //todo: send alert message?
@@ -2560,10 +2573,11 @@ end;
 //   3 - Socket Disconnected
 //   4 - Data too long
 // 101 - Encryption failed
-function TLSSend(var outData: array[128] of byte; dataLength: byte): byte;
+function TLSSend128(var outData: array[1024] of byte; dataLength: word): byte;
 var toSend: array[128] of byte;
-    i: byte;
+    i, j: byte;
     len: byte;
+    ptr: ^ byte;
 begin
   result := 0;
   i := 0;
@@ -2581,7 +2595,19 @@ begin
           dataLength := 0;
         end;
       Mem_Cpy(@toSend, @outData + i * 128, len);
-      result := TLSSendInternal(outData, len);
+      
+     ptr := @toSend;
+      j := 0;
+      while (j < len) do
+        begin
+//          if (ptr^ = 0) then
+//            break;
+//          UART3_write(ptr^);
+          inc(ptr);
+          inc(j);
+        end;
+      
+      result := TLSSendInternal(toSend, len);
       if (result <> 0) then
         break;
       inc(i);
@@ -2601,13 +2627,14 @@ function TLSReceive(var dataLength: word): byte;
 var debugMsg: string[32];
     p: ^byte;
     msgSize: word;
-    i: word;
+    i, startIndex: word;
     tracelevel, traceType: byte;
     msgHmac: array[20] of byte;
 begin
   dataLength := 0;
   result := 0;
-  if host_response_len_ssl <> 0 then
+  startIndex := 0;
+  while (startIndex < host_response_len_ssl) do
     begin
       tracelevel := 6;
       traceType  := TRACE_TYPE_LOG;
@@ -2616,7 +2643,7 @@ begin
       TraceOut(debugMsg, Str_Len(debugMsg), tracelevel, traceType);
       TraceOut(host_response, host_response_len_ssl, tracelevel, traceType);
       
-      if (host_response[0] = TLS_CONTENT_ALERT) then
+      if (host_response[startIndex + 0] = TLS_CONTENT_ALERT) then
         begin
           tracelevel := 1;
           traceType  := TRACE_TYPE_ERROR;
@@ -2629,7 +2656,7 @@ begin
         end
       else
         begin
-            if (host_response[0] <> TLS_CONTENT_APPLICATION_DATA) then
+            if (host_response[startIndex + 0] <> TLS_CONTENT_APPLICATION_DATA) then
               begin
                 debugMsg := 'Invalid packet'; // todo: disconnect
                 TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
@@ -2637,7 +2664,7 @@ begin
                 exit;
               end;
 
-            if (host_response[1] <> TLS_VERSION_HIGH) then
+            if (host_response[startIndex + 1] <> TLS_VERSION_HIGH) then
                 begin
                   debugMsg := 'Invalid TLS version'; // todo: disconnect
                   TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
@@ -2645,28 +2672,26 @@ begin
                   exit;
                 end;
 
-            if (host_response[2] <> TLS_VERSION_LO) then
+            if (host_response[startIndex + 2] <> TLS_VERSION_LO) then
                 begin
                   debugMsg := 'Invalid TLS version'; // todo: disconnect
                   TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
                   result := 4;
                   exit;
                end;
-        end;
 
-      Hi(msgSize) := host_response[3];
-      Lo(msgSize) := host_response[4];
+        Hi(msgSize) := host_response[startIndex + 3];
+        Lo(msgSize) := host_response[startIndex + 4];
+        startIndex := startIndex + msgSize; // in case there are other messages concatenated
+        p := @host_response;
 
-      p := @host_response;
+        for i := 5 to 20 do
+          server_write_IV[i-5] := host_response[i];
 
-      for i := 5 to 20 do
-        server_write_IV[i-5] := host_response[i];
-      
-      p := p + 5 + 16;
-       
-      i := 0;
-      //while (msgSize > 0) do
-        begin
+        p := p + 5 + 16;
+
+        i := 0;
+
           result := AES_128_CBC_decrypt(@Server_write_key, @server_write_IV, p, msgSize - 16); // -16 = skip IV
           if (result <> 0) then
             begin
@@ -2694,11 +2719,155 @@ begin
               TraceOut(host_response, dataLength, tracelevel, traceType);
             end;
        end;
-    end
-  else
-    begin
-      //UART3_Write_Text('no data ');
+      inc(startIndex); // next message, if any
     end;
 end;
+
+//todo: refactor TLSSend. It is already used in ClientFinished
+// return values:
+//   0 - No Errors
+//   1 - Socket not opened
+//   2 - Timeout on send
+//   3 - Socket Disconnected
+//   4 - Data too long
+// 101 - Encryption failed
+function TLSSend(var outData: array[1024] of byte; dataLength: word): byte;
+var i, limit: word;
+    paddingByte: byte;
+    messageHMAC: array[20] of byte;
+    toEncrypt: array[1300] of byte;
+    debugMsg: string[32];
+    messageLength: word;
+{
+  Sequence number is never transmitted, encrypted or otherwise;
+  it’s just prepended to the MAC buffer before the packet is MAC’ed. Therefore,
+  given a content buffer of “content”, the buffer that is MAC’ed looks like this:
+
+  buffer = <SeqNumber:8><MessageType:1><Version:2><ContentLength:2><Content:Variable>
+
+  Digest is calculated over the buffer
+  digest = MAC(buffer) = SHA1(Buffer) - 20 bytes
+
+  prepared = <MessageType:1><Version:2><ContentLen+MacLen+PaddingLen:2><Content:Variable><digest:20>
+
+  encrypted = ENCRYPT(prepared)
+
+  toSend = <MessageType:1 = 0x17><Version:2><Length:2 = 0x0080><encrypted:128>
+
+  MessageType 0x17 = Content Application Data
+}
+begin
+  result := 1; // prepare for errors
+  if (dataLength > 1024) then
+    begin
+      result := 4; // data too long
+      exit;
+    end;
+ // the Plan:
+      //   1. calculate HMAC on associated data + outData
+      //   2. Pad HMAC and verify data
+      //   3. CBC encrypt padded message using client IV
+      //   4. pack the message
+
+      // 1. calculate HMAC on associated data + outData
+      Mem_Set(@toEncrypt, 0, 1300);
+      // associated data // current sequence number, 8 bytes
+      for i := 0 to 7 do
+        toEncrypt[i] := sequenceNumber[i];
+
+      // TLS record header
+      toEncrypt[8]  := TLS_CONTENT_APPLICATION_DATA;
+      toEncrypt[9]  := TLS_VERSION_HIGH;
+      toEncrypt[10] := TLS_VERSION_LO;
+      toEncrypt[11] := Hi(dataLength);     // Message length Hi
+      toEncrypt[12] := Lo(dataLength);     // Record  length
+
+      for i := 0 to dataLength - 1 do
+        begin
+          toEncrypt[i + 13] := outData[i];
+        end;
+
+      // calculate HMAC SHA-1 of the message
+      HMAC_ShaMd5(@client_write_MAC_secret,  // Secret
+                  20,             // Secret length
+                  @toEncrypt,     // Data to hash
+                  dataLength + 13,// Data length
+                  @messageHMAC ,  // Hash result
+                  0);             // SHA-1
+
+      //2. concat outData and HMAC
+      Mem_Set(@toEncrypt, 0, 1300);
+
+      // copy outData
+      for i := 0 to dataLength - 1 do
+        toEncrypt[i] := outData[i];
+
+      // copy HMAC
+      for i := 0 to 19 do
+        toEncrypt[dataLength + i] := messageHMAC[i];
+      // calculate number of padding bytes and their value
+      i := 20 + dataLength;
+      paddingByte := 0;
+      while (i mod 16) <> 0 do
+        begin
+          inc(i);
+          inc(paddingByte);
+        end;
+      limit := i;
+      for i := dataLength + 20 to limit - 1 do
+        toEncrypt[i] := paddingByte - 1; // for ex. if there are 5 bytes needed, all of them would have the value of 0x04
+
+      //3. CBC encrypt
+      result := AES_128_CBC_encrypt(@client_write_key, @client_write_IV, @toEncrypt, limit);
+      
+      if (result <> 0) then
+        begin
+          debugMsg := 'Encryption failed';
+          TraceOut(debugMsg, Str_Len(debugMsg), 1, TRACE_TYPE_ERROR);
+          TraceOut(toEncrypt, limit, 1, TRACE_TYPE_ERROR);
+          result := 101;
+        end
+      else
+        begin
+            // 4. pack the message
+            messageLength := 16 + limit;
+            
+//            UART3_Write(' ');
+//            Word2Str(messageLength, debugMsg);
+//            UART3_Write_Text(debugMsg);
+//            UART3_Write(' ');
+            
+            HTTP_data_out[0] := TLS_CONTENT_APPLICATION_DATA;
+            HTTP_data_out[1] := TLS_VERSION_HIGH;
+            HTTP_data_out[2] := TLS_VERSION_LO;
+            HTTP_data_out[3] := Hi(messageLength);  // Message length Hi
+            HTTP_data_out[4] := lo(messageLength);  // Record  length Lo
+
+            // append client IV
+            for i := 0 to 15 do
+              HTTP_data_out[5 + i] := client_write_IV[i];
+
+            for i := 0 to limit - 1 do
+              HTTP_data_out[21 + i] := toEncrypt[i];
+
+            messageLength := messageLength + 5; // add header
+            result := SendMessage(messageLength, false);
+            if (result = 0) then
+              begin
+                IncrementSequenceNumber();
+//              Note: The initialization vector to be used in next packet is the last 16 bytes of
+//                  the previously sent packet:
+                for i := 0 to 15 do
+                  begin
+                    client_write_IV[i] := HTTP_data_out[messageLength - 16 + i];
+                  end;
+              end
+            else
+              begin
+                // failed to send
+              end;
+        end;
+end;
+
 
 end.
